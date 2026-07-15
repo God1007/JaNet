@@ -3,11 +3,14 @@
 import {
   Activity,
   Brain,
+  Cpu,
   Database,
   Gauge,
+  Globe2,
   Network,
   RefreshCw,
   Router,
+  Search,
   Server,
   ShieldCheck,
   Sparkles,
@@ -33,6 +36,12 @@ import type { FormEvent, ReactNode } from "react";
 import type {
   InterfaceSnapshot,
   NetworkEvent,
+  ProcessResourceMetrics,
+  RequestFailureAlert,
+  RequestFailureCategory,
+  RequestFailureEvent,
+  RequestFailureSnapshot,
+  ResourceSample,
   Snapshot,
   TrafficMapObservability,
   TrafficSample
@@ -48,6 +57,12 @@ import {
   formatPacketsPerSecond,
   formatPercent
 } from "./lib/traffic_metrics.mjs";
+import {
+  appendResourceSample,
+  createResourceSample,
+  formatResourceBytes,
+  formatUptime
+} from "./lib/resource_metrics.mjs";
 import { buildProbeRhythm } from "./lib/latency_series.mjs";
 import {
   reconcileSeriesSelection,
@@ -61,6 +76,30 @@ const trafficSeriesOptions = [
   { id: "activeFlows", label: "Active flows", color: "var(--chart-3)" }
 ];
 const trafficSeriesIds = trafficSeriesOptions.map((option) => option.id);
+const cpuSeriesOptions = [
+  { id: "engineCpuPercent", label: "Engine CPU", color: "var(--chart-1)" },
+  { id: "dashboardCpuPercent", label: "Dashboard CPU", color: "var(--chart-2)" }
+];
+const memorySeriesOptions = [
+  { id: "engineResidentMemoryBytes", label: "Engine RSS", color: "var(--chart-1)" },
+  { id: "dashboardResidentMemoryBytes", label: "Dashboard RSS", color: "var(--chart-2)" }
+];
+const cpuSeriesIds = cpuSeriesOptions.map((option) => option.id);
+const memorySeriesIds = memorySeriesOptions.map((option) => option.id);
+const requestFailureVisibleLimit = 50;
+const requestAlertVisibleLimit = 12;
+const requestFailureFilters = [
+  { id: "all", label: "All" },
+  { id: "active", label: "Active alerts" },
+  { id: "4xx", label: "4xx" },
+  { id: "5xx", label: "5xx" },
+  { id: "dns", label: "DNS" },
+  { id: "connection", label: "Connection" },
+  { id: "tls", label: "TLS" },
+  { id: "network", label: "Other network" },
+  { id: "cancelled-policy", label: "Cancelled / policy" }
+] as const;
+type RequestFailureFilter = typeof requestFailureFilters[number]["id"];
 const apiBaseUrl = __API_BASE_URL__.replace(/\/$/, "");
 const wsBaseUrl = __WS_BASE_URL__.replace(/\/$/, "");
 type Theme = "light" | "dark";
@@ -120,6 +159,56 @@ function availableMetric<T>(availability: string, value: T | null, formatter: (n
   return availability === "AVAILABLE" && value !== null ? formatter(value) : "n/a";
 }
 
+function requestObserverState(snapshot: RequestFailureSnapshot | null) {
+  if (!snapshot?.enabled) return { value: "setup", tone: "muted" as const };
+  if (snapshot.connectedRecent) return { value: "live", tone: "ok" as const };
+  if (snapshot && (snapshot.lastHeartbeatAt > 0 || snapshot.lastReceivedAt > 0)) {
+    return { value: "offline", tone: "warn" as const };
+  }
+  return { value: "setup", tone: "muted" as const };
+}
+
+function requestFailureKey(host: string, failureCode: string) {
+  return `${host}\u0000${failureCode}`;
+}
+
+function matchesRequestFailureFilter(
+  item: Pick<RequestFailureEvent, "category" | "statusCode">,
+  filter: RequestFailureFilter,
+  active: boolean
+) {
+  if (filter === "all") return true;
+  if (filter === "active") return active;
+  if (filter === "4xx") return item.statusCode !== null && item.statusCode >= 400 && item.statusCode < 500;
+  if (filter === "5xx") return item.statusCode !== null && item.statusCode >= 500 && item.statusCode < 600;
+  if (filter === "cancelled-policy") return item.category === "cancelled" || item.category === "policy";
+  return item.category === filter;
+}
+
+function requestOutcome(value: Pick<RequestFailureEvent, "statusCode" | "networkError" | "failureCode">) {
+  return value.statusCode !== null
+    ? `HTTP ${value.statusCode}`
+    : value.networkError || value.failureCode || "Browser error";
+}
+
+function requestOutcomeTone(value: Pick<RequestFailureEvent, "statusCode" | "category">) {
+  if (value.statusCode !== null && value.statusCode >= 500) return "danger";
+  if (value.statusCode !== null) return "warning";
+  return value.category === "cancelled" || value.category === "policy" ? "muted" : "danger";
+}
+
+function requestCategoryTone(category: RequestFailureCategory): "good" | "warning" | "danger" | "muted" {
+  if (category === "http") return "warning";
+  if (category === "cancelled" || category === "policy") return "muted";
+  return "danger";
+}
+
+function formatWindowSeconds(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "n/a";
+  if (seconds % 60 === 0) return `${seconds / 60} min`;
+  return `${seconds} sec`;
+}
+
 // 管理浏览器到 BFF 的 WebSocket，并把首连历史和实时增量统一交给事件 reducer。
 function useEventStream(onEvent: (event: NetworkEvent) => void) {
   const [connected, setConnected] = useState(false);
@@ -163,7 +252,10 @@ function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [events, setEvents] = useState<NetworkEvent[]>([]);
   const [trafficHistory, setTrafficHistory] = useState<TrafficSample[]>([]);
+  const [resourceHistory, setResourceHistory] = useState<ResourceSample[]>([]);
   const [selectedTrafficSeries, setSelectedTrafficSeries] = useState<string[]>(["bytesPerSecond"]);
+  const [selectedCpuSeries, setSelectedCpuSeries] = useState<string[]>(cpuSeriesIds);
+  const [selectedMemorySeries, setSelectedMemorySeries] = useState<string[]>(memorySeriesIds);
   const [selectedProbeTargets, setSelectedProbeTargets] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -217,6 +309,10 @@ function App() {
       const trafficSample = createTrafficSample(next.networkSnapshot);
       if (trafficSample) {
         setTrafficHistory((current) => appendTrafficSample(current, trafficSample, 72));
+      }
+      const resourceSample = createResourceSample(next.runtimeResources);
+      if (resourceSample) {
+        setResourceHistory((current) => appendResourceSample(current, resourceSample, 72));
       }
       setEvents((current) => {
         const merged = [...current, ...next.events];
@@ -302,6 +398,14 @@ function App() {
     setSelectedProbeTargets((current) => toggleSeriesSelection(current, target, availableProbeTargets));
   }
 
+  function toggleCpuSeries(seriesId: string) {
+    setSelectedCpuSeries((current) => toggleSeriesSelection(current, seriesId, cpuSeriesIds));
+  }
+
+  function toggleMemorySeries(seriesId: string) {
+    setSelectedMemorySeries((current) => toggleSeriesSelection(current, seriesId, memorySeriesIds));
+  }
+
   async function runAnalysis() {
     setAiLoading(true);
     setAiError("");
@@ -340,6 +444,11 @@ function App() {
   }
 
   const network = mergedSnapshot?.networkSnapshot ?? null;
+  const runtimeResources = mergedSnapshot?.runtimeResources ?? null;
+  const requestFailures = mergedSnapshot?.requestFailures ?? null;
+  const browserRequestState = requestObserverState(requestFailures);
+  const engineResources = runtimeResources?.engine ?? network?.engineResources ?? null;
+  const dashboardResources = runtimeResources?.dashboard ?? null;
   // 无活动出口时绝不回退到 interfaces[0]，避免把残留指标误报成当前链路。
   const activeInterface = network?.hasActiveInterface
     ? network.interfaces.find((item) => item.interfaceName === network.activeInterface)
@@ -367,6 +476,10 @@ function App() {
   const showTrafficPackets = selectedTrafficSeries.includes("packetsPerSecond");
   const showTrafficFlows = selectedTrafficSeries.includes("activeFlows");
   const showTrafficCounts = showTrafficPackets || showTrafficFlows;
+  const showEngineCpu = selectedCpuSeries.includes("engineCpuPercent");
+  const showDashboardCpu = selectedCpuSeries.includes("dashboardCpuPercent");
+  const showEngineMemory = selectedMemorySeries.includes("engineResidentMemoryBytes");
+  const showDashboardMemory = selectedMemorySeries.includes("dashboardResidentMemoryBytes");
 
   return (
     <main className="app-shell">
@@ -382,6 +495,7 @@ function App() {
           <div className="status-cluster" aria-live="polite">
             <StatusPill ok={Boolean(mergedSnapshot?.grpc.ok)} label="gRPC" value={mergedSnapshot?.grpc.ok ? "online" : "offline"} />
             <StatusPill ok={eventStream.connected} label="Events" value={eventStream.connected ? "live" : "offline"} />
+            <StatusPill ok={browserRequestState.tone === "ok"} tone={browserRequestState.tone} label="Browser" value={browserRequestState.value} />
             <StatusPill ok={Boolean(mergedSnapshot?.ai.configured)} label="AI" value={mergedSnapshot?.ai.configured ? "ready" : "not configured"} />
             <StatusPill ok={Boolean(observation?.valid)} label="Capture" value={observation?.valid ? "trusted" : observation?.baselineOnly ? "warming" : "degraded"} />
           </div>
@@ -658,6 +772,113 @@ function App() {
             <div className="notice warning" role="status">The server did not return a typed network snapshot. Detailed traffic evidence is unavailable.</div>
           )}
 
+          <section className="panel resource-panel" data-testid="runtime-footprint">
+            <PanelHeading
+              eyebrow="Runtime footprint"
+              title="Resource and scheduler statistics"
+              icon={<Cpu size={20} />}
+              meta={`${resourceHistory.length} browser-local samples · ${runtimeResources ? `sampled ${formatAge(runtimeResources.sampledAt)}` : "runtime sampler unavailable"}`}
+            />
+            <div className="resource-semantics">
+              <strong>CPU scale</strong>
+              <span>One logical CPU core equals 100%; a multi-threaded process can exceed 100%.</span>
+              {runtimeResources?.cpuSemantics && <code>{runtimeResources.cpuSemantics}</code>}
+            </div>
+            <div className="resource-summary-strip">
+              <DataFact
+                label="Combined resident memory"
+                value={formatResourceBytes(runtimeResources?.combinedResidentMemoryBytes)}
+                meta={runtimeResources?.combinedResidentMemoryComplete ? "Engine RSS + Dashboard RSS" : "Requires both process samples"}
+              />
+              <DataFact
+                label="Engine sample window"
+                value={processMetric(engineResources, engineResources?.sampleWindowMs, (value) => `${formatCount(value)} ms`)}
+                meta={`${processMetric(engineResources, engineResources?.logicalCpuCount, (value) => formatCount(value))} logical CPUs`}
+              />
+              <DataFact
+                label="Dashboard sample window"
+                value={processMetric(dashboardResources, dashboardResources?.sampleWindowMs, (value) => `${formatCount(value)} ms`)}
+                meta={`${processMetric(dashboardResources, dashboardResources?.logicalCpuCount, (value) => formatCount(value))} logical CPUs`}
+              />
+              <DataFact
+                label="History retention"
+                value={`${formatCount(resourceHistory.length)} / 72`}
+                meta="Current page session only"
+              />
+            </div>
+
+            <div className="resource-process-grid">
+              <ProcessResourceCard label="Network engine" process={engineResources} />
+              <ProcessResourceCard label="Dashboard BFF" process={dashboardResources} />
+            </div>
+
+            <div className="resource-chart-grid">
+              <article className="resource-chart-card">
+                <h3>CPU utilization trend</h3>
+                <SeriesSelector
+                  label="Visible CPU series"
+                  options={cpuSeriesOptions.map((option) => ({
+                    ...option,
+                    detail: option.id === "engineCpuPercent"
+                      ? processMetric(engineResources, engineResources?.cpuPercent, (value) => formatPercent(value))
+                      : processMetric(dashboardResources, dashboardResources?.cpuPercent, (value) => formatPercent(value))
+                  }))}
+                  selectedIds={selectedCpuSeries}
+                  controls="resource-cpu-chart"
+                  onToggle={toggleCpuSeries}
+                />
+                <div className="resource-chart-canvas" id="resource-cpu-chart">
+                  {resourceHistory.length ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={resourceHistory} margin={{ top: 10, right: 8, bottom: 0, left: 0 }}>
+                        <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
+                        <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} />
+                        <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={52} tickFormatter={(value) => `${value}%`} />
+                        <Tooltip formatter={(value) => formatPercent(value)} contentStyle={{ background: "var(--chart-tooltip-bg)", border: "1px solid var(--chart-tooltip-border)", borderRadius: 6, color: "var(--chart-tooltip-text)" }} labelStyle={{ color: "var(--chart-tooltip-text)" }} itemStyle={{ color: "var(--chart-tooltip-text)" }} />
+                        {showEngineCpu && <Line type="monotone" dataKey="engineCpuPercent" stroke="var(--chart-1)" strokeWidth={2} dot={false} name="Engine CPU" isAnimationActive={false} />}
+                        {showDashboardCpu && <Line type="monotone" dataKey="dashboardCpuPercent" stroke="var(--chart-2)" strokeWidth={2} dot={false} name="Dashboard CPU" isAnimationActive={false} />}
+                      </LineChart>
+                    </ResponsiveContainer>
+                  ) : <EmptyLine text="Waiting for the first runtime resource sample." />}
+                </div>
+                <p className="chart-note">Instantaneous process CPU over each sampler window; missing samples remain gaps.</p>
+              </article>
+
+              <article className="resource-chart-card">
+                <h3>Resident memory trend</h3>
+                <SeriesSelector
+                  label="Visible RSS series"
+                  options={memorySeriesOptions.map((option) => ({
+                    ...option,
+                    detail: option.id === "engineResidentMemoryBytes"
+                      ? processMetric(engineResources, engineResources?.residentMemoryBytes, (value) => formatResourceBytes(value))
+                      : processMetric(dashboardResources, dashboardResources?.residentMemoryBytes, (value) => formatResourceBytes(value))
+                  }))}
+                  selectedIds={selectedMemorySeries}
+                  controls="resource-memory-chart"
+                  onToggle={toggleMemorySeries}
+                />
+                <div className="resource-chart-canvas" id="resource-memory-chart">
+                  {resourceHistory.length ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={resourceHistory} margin={{ top: 10, right: 8, bottom: 0, left: 0 }}>
+                        <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
+                        <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} />
+                        <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={70} tickFormatter={(value) => formatResourceBytes(value)} />
+                        <Tooltip formatter={(value) => formatResourceBytes(value)} contentStyle={{ background: "var(--chart-tooltip-bg)", border: "1px solid var(--chart-tooltip-border)", borderRadius: 6, color: "var(--chart-tooltip-text)" }} labelStyle={{ color: "var(--chart-tooltip-text)" }} itemStyle={{ color: "var(--chart-tooltip-text)" }} />
+                        {showEngineMemory && <Line type="monotone" dataKey="engineResidentMemoryBytes" stroke="var(--chart-1)" strokeWidth={2} dot={false} name="Engine RSS" isAnimationActive={false} />}
+                        {showDashboardMemory && <Line type="monotone" dataKey="dashboardResidentMemoryBytes" stroke="var(--chart-2)" strokeWidth={2} dot={false} name="Dashboard RSS" isAnimationActive={false} />}
+                      </LineChart>
+                    </ResponsiveContainer>
+                  ) : <EmptyLine text="Waiting for the first runtime resource sample." />}
+                </div>
+                <p className="chart-note">RSS is current resident memory, not cumulative allocation or virtual address space.</p>
+              </article>
+            </div>
+          </section>
+
+          <RequestFailurePanel snapshot={requestFailures} />
+
           <section className="evidence-grid" id="diagnostic-evidence">
             <article className="panel chart-panel">
               <PanelHeading eyebrow="Latency trace" title="Probe rhythm" icon={<Wifi size={20} />} meta={`${mergedSnapshot.latencySeries.length} retained results · ${probeRhythm.series.length} targets`} />
@@ -776,6 +997,210 @@ function App() {
   );
 }
 
+// Chrome 扩展只上报真实用户请求的失败终态；筛选只作用于服务端已有界结果，不复制长期历史。
+function RequestFailurePanel({ snapshot }: { snapshot: RequestFailureSnapshot | null }) {
+  const [hostFilter, setHostFilter] = useState("");
+  const [failureFilter, setFailureFilter] = useState<RequestFailureFilter>("all");
+  const observer = requestObserverState(snapshot);
+  const hostNeedle = hostFilter.trim().toLowerCase();
+  const activeKeys = useMemo(
+    () => new Set((snapshot?.activeAlerts ?? []).map((alert) => requestFailureKey(alert.host, alert.failureCode))),
+    [snapshot]
+  );
+  const filteredAlerts = useMemo(
+    () => (snapshot?.activeAlerts ?? []).filter((alert) => {
+      const matchesHost = !hostNeedle || alert.host.toLowerCase().includes(hostNeedle);
+      return matchesHost && matchesRequestFailureFilter(alert, failureFilter, true);
+    }),
+    [failureFilter, hostNeedle, snapshot]
+  );
+  const filteredFailures = useMemo(
+    () => (snapshot?.recentFailures ?? []).filter((failure) => {
+      const matchesHost = !hostNeedle || failure.host.toLowerCase().includes(hostNeedle);
+      const active = activeKeys.has(requestFailureKey(failure.host, failure.failureCode));
+      return matchesHost && matchesRequestFailureFilter(failure, failureFilter, active);
+    }),
+    [activeKeys, failureFilter, hostNeedle, snapshot]
+  );
+  const visibleAlerts = filteredAlerts.slice(0, requestAlertVisibleLimit);
+  const visibleFailures = filteredFailures.slice(0, requestFailureVisibleLimit);
+  const contactAt = snapshot?.lastContactAt
+    ?? Math.max(snapshot?.lastHeartbeatAt ?? 0, snapshot?.lastReceivedAt ?? 0);
+  const contactMeta = contactAt
+    ? `Last extension contact ${formatAge(contactAt)}`
+    : "No extension contact received";
+  const windowValue = snapshot
+    ? `${snapshot.failuresInWindowCapped ? "≥" : ""}${formatCount(snapshot.failuresInWindow)}`
+    : "n/a";
+
+  return (
+    <section className="panel request-failure-panel" data-testid="request-failure-watch">
+      <PanelHeading
+        eyebrow="Passive application layer"
+        title="Real browser request failures"
+        icon={<Globe2 size={20} />}
+        meta={`${snapshot?.source || "chrome-mv3-webrequest"} | server-bounded recent failures`}
+      />
+
+      <div className="request-observer-explainer">
+        <div>
+          <strong>Chrome webRequest observes the user&apos;s real HTTP and HTTPS request terminal events.</strong>
+          <p>JaNet does not create these requests, proxy browser traffic, or decrypt TLS.</p>
+        </div>
+        <div>
+          <strong>HTTP response status and browser network errors are different evidence.</strong>
+          <p>Received HTTP responses over HTTP or HTTPS show status codes such as 404, 429, or 500. DNS, TCP connection, and TLS handshake failures happen before an HTTP response, so Chrome reports a browser error instead.</p>
+        </div>
+      </div>
+
+      <div className="request-failure-kpis">
+        <DataFact
+          label="Total failures"
+          value={snapshot ? formatCount(snapshot.totalFailures) : "n/a"}
+          meta="Cumulative accepted failures in this BFF process"
+        />
+        <DataFact
+          label="Failures in window"
+          value={windowValue}
+          meta={snapshot?.failuresInWindowCapped
+            ? "Lower bound because a bounded window was capped"
+            : snapshot
+              ? `${formatWindowSeconds(snapshot.windowSeconds)} sliding window`
+              : "Window unavailable"}
+          tone={snapshot?.failuresInWindow ? "warning" : "default"}
+        />
+        <DataFact
+          label="Active alerts"
+          value={snapshot ? formatCount(snapshot.activeAlerts.length) : "n/a"}
+          meta={snapshot ? `${formatCount(snapshot.threshold)} matching failures per host and outcome` : "Threshold unavailable"}
+          tone={snapshot?.activeAlerts.length ? "warning" : "default"}
+        />
+        <DataFact
+          label="Extension contact"
+          value={observer.value}
+          meta={contactMeta}
+          tone={observer.tone === "ok" ? "good" : observer.tone === "warn" ? "warning" : "muted"}
+        />
+      </div>
+
+      <div className="request-failure-controls">
+        <label className="request-host-filter" htmlFor="request-host-filter">
+          <span>Host contains</span>
+          <span className="request-host-input">
+            <Search size={14} aria-hidden="true" />
+            <input
+              id="request-host-filter"
+              type="search"
+              value={hostFilter}
+              onChange={(event) => setHostFilter(event.target.value)}
+              placeholder="github.com"
+              autoComplete="off"
+            />
+          </span>
+        </label>
+        <div className="request-class-filter">
+          <span id="request-class-filter-label">Failure class</span>
+          <div role="group" aria-labelledby="request-class-filter-label">
+            {requestFailureFilters.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                aria-pressed={failureFilter === option.id}
+                onClick={() => setFailureFilter(option.id)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="request-failure-layout">
+        <section className="request-alert-region" aria-labelledby="request-alert-heading">
+          <header>
+            <div>
+              <h3 id="request-alert-heading">Active threshold alerts</h3>
+              <p>Same host and outcome within {snapshot ? formatWindowSeconds(snapshot.windowSeconds) : "the configured window"}.</p>
+            </div>
+            <span>{filteredAlerts.length} matching</span>
+          </header>
+          <div className="request-alert-list">
+            {visibleAlerts.length === 0 && (
+              <EmptyLine text={snapshot?.activeAlerts.length ? "No active alerts match the current filters." : "No request failure threshold is currently firing."} />
+            )}
+            {visibleAlerts.map((alert) => <RequestAlertRow alert={alert} key={alert.id} />)}
+          </div>
+          {filteredAlerts.length > visibleAlerts.length && (
+            <p className="request-retention-note">Showing {visibleAlerts.length} of {filteredAlerts.length} matching active alerts.</p>
+          )}
+        </section>
+
+        <section className="request-recent-region" aria-labelledby="request-recent-heading">
+          <header>
+            <div>
+              <h3 id="request-recent-heading">Recent request failures</h3>
+              <p>Newest first. URL path, query, fragment, credentials, headers, and bodies are not collected.</p>
+            </div>
+            <span>{filteredFailures.length} matching</span>
+          </header>
+          {visibleFailures.length === 0 ? (
+            <EmptyLine text={snapshot?.recentFailures.length ? "No retained failures match the current host and failure-class filters." : "No real browser request failures have been received yet."} />
+          ) : (
+            <div className="request-failure-table-scroll">
+              <table className="request-failure-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Host</th>
+                    <th>Method / type</th>
+                    <th>Server IP</th>
+                    <th>HTTP status / browser error</th>
+                    <th>Category</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleFailures.map((failure) => (
+                    <tr key={failure.eventId}>
+                      <td><time dateTime={new Date(failure.occurredAt).toISOString()}>{formatTime(failure.occurredAt)}</time><small>{formatAge(failure.occurredAt)}</small></td>
+                      <td><strong title={failure.host}>{failure.host}</strong><small>Path omitted</small></td>
+                      <td><strong>{failure.method}</strong><small>{failure.resourceType}{failure.fromCache ? " | cache" : ""}</small></td>
+                      <td><code>{failure.serverIp || "n/a"}</code><small>{failure.scheme.toUpperCase()}:{failure.port}</small></td>
+                      <td><strong className={`request-outcome ${requestOutcomeTone(failure)}`}>{requestOutcome(failure)}</strong><small>{failure.terminal === "completed" ? "HTTP response received" : "No HTTP response"}</small></td>
+                      <td><StatusTag tone={requestCategoryTone(failure.category)}>{failure.category}</StatusTag></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="request-retention-note">
+            Showing {visibleFailures.length} of {filteredFailures.length} matching failures. The BFF currently retains {formatCount(snapshot?.stats.recentSize ?? 0)} recent rows and bounds groups, IPs, dedupe keys, and alert transitions.
+          </p>
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function RequestAlertRow({ alert }: { alert: RequestFailureAlert }) {
+  return (
+    <article className="request-alert-row">
+      <header>
+        <div>
+          <strong title={alert.host}>{alert.host}</strong>
+          <small>{alert.resourceType || "other"} | last seen {formatAge(alert.lastSeenAt)}</small>
+        </div>
+        <StatusTag tone="danger">Firing</StatusTag>
+      </header>
+      <code className={`request-alert-code ${requestOutcomeTone(alert)}`}>{requestOutcome(alert)}</code>
+      <dl>
+        <div><dt>Window count</dt><dd>{formatCount(alert.countInWindow)} / {formatCount(alert.threshold)}</dd></div>
+        <div><dt>Last server IP</dt><dd>{alert.lastIp || "n/a"}</dd></div>
+      </dl>
+    </article>
+  );
+}
+
 type SeriesSelectorOption = {
   id: string;
   label: string;
@@ -842,8 +1267,8 @@ function PanelHeading({ eyebrow, title, icon, meta }: { eyebrow: string; title: 
   return <div className="panel-heading"><div><span className="quiet-label">{eyebrow}</span><h2>{title}</h2>{meta && <p>{meta}</p>}</div><span className="heading-icon" aria-hidden="true">{icon}</span></div>;
 }
 
-function StatusPill({ ok, label, value }: { ok: boolean; label: string; value: string }) {
-  return <span className={ok ? "status-pill ok" : "status-pill warn"}><i />{label}<strong>{value}</strong></span>;
+function StatusPill({ ok, label, value, tone }: { ok: boolean; label: string; value: string; tone?: "ok" | "warn" | "muted" }) {
+  return <span className={`status-pill ${tone || (ok ? "ok" : "warn")}`}><i />{label}<strong>{value}</strong></span>;
 }
 
 function StatusTag({ tone, children }: { tone: "good" | "warning" | "danger" | "muted"; children: ReactNode }) {
@@ -860,6 +1285,73 @@ function RouteFact({ label, value }: { label: string; value: string }) {
 
 function DataFact({ label, value, meta, tone = "default" }: { label: string; value: string; meta?: string; tone?: "default" | "good" | "warning" | "muted" }) {
   return <div className={`data-fact ${tone}`}><span>{label}</span><strong>{value}</strong>{meta && <small>{meta}</small>}</div>;
+}
+
+function processMetric(
+  process: ProcessResourceMetrics | null,
+  value: number | null | undefined,
+  formatter: (next: number) => string
+) {
+  return process?.available && value !== null && value !== undefined && Number.isFinite(value)
+    ? formatter(value)
+    : "n/a";
+}
+
+function secondsWithPrecision(value: number) {
+  return `${value.toFixed(value >= 100 ? 1 : 2).replace(/\.0+$/, "")} s`;
+}
+
+// 主视图保留可快速扫读的运行指标；完整内存、CPU 和调度计数放在同卡片的展开区。
+function ProcessResourceCard({ label, process }: { label: string; process: ProcessResourceMetrics | null }) {
+  const unavailableMetrics = process?.unavailableMetrics ?? [];
+  const statusLabel = process?.available ? "Available" : "Unavailable";
+
+  return (
+    <article className="resource-process-card">
+      <header>
+        <div>
+          <span className="quiet-label">{process?.component || label}</span>
+          <h3>{label}</h3>
+        </div>
+        <div className="resource-process-status">
+          <StatusTag tone={process?.available ? "good" : "muted"}>{statusLabel}</StatusTag>
+          <small>{process ? `sampled ${formatAge(process.sampledAt)}` : "no process sample"}</small>
+        </div>
+      </header>
+      <dl className="resource-primary-metrics">
+        <ResourceMetric label="CPU" value={processMetric(process, process?.cpuPercent, (value) => formatPercent(value))} />
+        <ResourceMetric label="Resident memory" value={processMetric(process, process?.residentMemoryBytes, (value) => formatResourceBytes(value))} />
+        <ResourceMetric label="Threads" value={processMetric(process, process?.threadCount, (value) => formatCount(value))} />
+        <ResourceMetric label="Open FDs" value={processMetric(process, process?.openFileDescriptors, (value) => formatCount(value))} />
+        <ResourceMetric label="Uptime" value={processMetric(process, process?.uptimeSeconds, (value) => formatUptime(value))} />
+        <ResourceMetric label="Voluntary ctx total" value={processMetric(process, process?.voluntaryContextSwitches, (value) => formatCount(value))} />
+        <ResourceMetric label="Involuntary ctx total" value={processMetric(process, process?.involuntaryContextSwitches, (value) => formatCount(value))} />
+        <ResourceMetric label="Active resources" value={processMetric(process, process?.activeResources, (value) => formatCount(value))} />
+      </dl>
+      <details className="resource-details">
+        <summary>Extended process counters</summary>
+        <dl>
+          <ResourceMetric label="Peak RSS" value={processMetric(process, process?.peakResidentMemoryBytes, (value) => formatResourceBytes(value))} />
+          <ResourceMetric label="Virtual memory" value={processMetric(process, process?.virtualMemoryBytes, (value) => formatResourceBytes(value))} />
+          <ResourceMetric label="User CPU" value={processMetric(process, process?.userCpuSeconds, secondsWithPrecision)} />
+          <ResourceMetric label="System CPU" value={processMetric(process, process?.systemCpuSeconds, secondsWithPrecision)} />
+          <ResourceMetric label="Heap used" value={processMetric(process, process?.heapUsedBytes, (value) => formatResourceBytes(value))} />
+          <ResourceMetric label="Heap total" value={processMetric(process, process?.heapTotalBytes, (value) => formatResourceBytes(value))} />
+          <ResourceMetric label="External memory" value={processMetric(process, process?.externalMemoryBytes, (value) => formatResourceBytes(value))} />
+          <ResourceMetric label="Array buffers" value={processMetric(process, process?.arrayBufferBytes, (value) => formatResourceBytes(value))} />
+          <ResourceMetric label="Minor faults" value={processMetric(process, process?.minorPageFaults, (value) => formatCount(value))} />
+          <ResourceMetric label="Major faults" value={processMetric(process, process?.majorPageFaults, (value) => formatCount(value))} />
+        </dl>
+      </details>
+      {unavailableMetrics.length > 0 && (
+        <p className="resource-unavailable"><strong>Unavailable metrics</strong>{unavailableMetrics.join(", ")}</p>
+      )}
+    </article>
+  );
+}
+
+function ResourceMetric({ label, value }: { label: string; value: string }) {
+  return <div><dt>{label}</dt><dd>{value}</dd></div>;
 }
 
 function Capability({ label, value, falseLabel = "Off", neutralWhenFalse = false }: { label: string; value: boolean; falseLabel?: string; neutralWhenFalse?: boolean }) {

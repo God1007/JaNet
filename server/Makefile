@@ -48,8 +48,8 @@ PROTO_HDRS=$(PROTO_H) $(GRPC_H)
 PROTO_STAMP=$(PROTO_GEN_DIR)/.weaknet_proto.stamp
 
 # 服务端手写源文件、头文件依赖和最终产物路径。
-SRC=src/server.cpp src/grpc_service.cpp src/net_iface.cpp src/serializer.cpp src/net_info.cpp src/weak_netmgr.cpp src/using_iface.cpp src/net_ping.cpp src/rtt_monitor.cpp src/rssi_monitor.cpp src/net_wifiriss.cpp src/net_tcp.cpp src/tcp_loss_monitor.cpp src/event_manager.cpp src/logger.cpp src/traffic_analyzer.cpp src/net_traffic.cpp src/traffic_anomaly_detector.cpp src/network_quality_assessor.cpp src/main.cpp
-INC=include/common.hpp include/grpc_service.hpp include/net_iface.h include/serializer.hpp include/server.hpp include/net_tcp.h include/tcp_loss_monitor.hpp include/weak_netmgr.hpp include/net_info.hpp include/rtt_monitor.hpp include/rssi_monitor.hpp include/event_manager.hpp include/logger.hpp include/traffic_analyzer.hpp include/traffic_observation_state.hpp include/network_quality_assessor.hpp include/net_traffic.h include/flow_abi.h include/flow_observation_core.hpp include/interface_snapshot_merge.hpp include/route_selection.hpp include/netlink_dump.hpp include/rtt_utils.hpp
+SRC=src/server.cpp src/grpc_service.cpp src/net_iface.cpp src/serializer.cpp src/net_info.cpp src/weak_netmgr.cpp src/using_iface.cpp src/net_ping.cpp src/rtt_monitor.cpp src/rssi_monitor.cpp src/net_wifiriss.cpp src/net_tcp.cpp src/tcp_loss_monitor.cpp src/event_manager.cpp src/logger.cpp src/traffic_analyzer.cpp src/net_traffic.cpp src/traffic_anomaly_detector.cpp src/network_quality_assessor.cpp src/process_resource_sampler.cpp src/main.cpp
+INC=include/common.hpp include/grpc_service.hpp include/net_iface.h include/serializer.hpp include/server.hpp include/net_tcp.h include/tcp_loss_monitor.hpp include/weak_netmgr.hpp include/net_info.hpp include/rtt_monitor.hpp include/rssi_monitor.hpp include/event_manager.hpp include/logger.hpp include/traffic_analyzer.hpp include/traffic_observation_state.hpp include/network_quality_assessor.hpp include/net_traffic.h include/flow_abi.h include/flow_observation_core.hpp include/interface_snapshot_merge.hpp include/route_selection.hpp include/netlink_dump.hpp include/rtt_utils.hpp include/process_resource_sampler.hpp
 
 # 服务端可执行文件、eBPF 对象与内核类型头文件的输出路径。
 BIN_DIR=bin
@@ -64,6 +64,7 @@ INTERFACE_SNAPSHOT_MERGE_TEST=$(BUILD_DIR)/interface_snapshot_merge_test
 SERVER_LIFECYCLE_CONTRACT_TEST=$(BUILD_DIR)/server_lifecycle_contract_test
 ROUTE_SELECTION_TEST=$(BUILD_DIR)/route_selection_test
 SERVER_CONTEXT_LIFECYCLE_TEST=$(BUILD_DIR)/server_context_lifecycle_test
+PROCESS_RESOURCE_SAMPLER_TEST=$(BUILD_DIR)/process_resource_sampler_test
 TRAFFIC_OBSERVATION_STATE_TEST=$(BUILD_DIR)/traffic_observation_state_test
 RTT_PRECISION_TEST=$(BUILD_DIR)/rtt_precision_test
 RTT_PROTO_ROUNDTRIP_TEST=$(BUILD_DIR)/rtt_proto_roundtrip_test
@@ -114,7 +115,7 @@ $(TARGET): $(SRC) $(INC) $(PROTO_SRCS) $(PROTO_HDRS) $(BPF_TARGET)
 	$(CC) $(CXXFLAGS) $(INCLUDES) -o $@ $(SRC) $(PROTO_SRCS) $(LDFLAGS)
 
 # clean 与 run 是命令目标，不依赖同名文件是否存在。
-.PHONY: clean run test-rtt test-traffic-core check-bpf-syntax check-bpf-object check-traffic-userspace test-traffic-linux test-traffic-kernel test-tc-ownership benchmark benchmark-smoke benchmark-standard benchmark-stress benchmark-traffic-core benchmark-core-tsan benchmark-bpf-maps benchmark-kernel-pressure benchmark-event-driver benchmark-help
+.PHONY: clean run test-rtt test-traffic-core test-process-resources check-bpf-syntax check-bpf-object check-traffic-userspace test-traffic-linux test-traffic-kernel test-tc-ownership benchmark benchmark-smoke benchmark-standard benchmark-stress benchmark-traffic-core benchmark-core-tsan benchmark-bpf-maps benchmark-kernel-pressure benchmark-event-driver benchmark-help
 
 # 无网络、无 root 的 RTT 回归：分别锁定领域模型/质量评分与 protobuf 二进制契约。
 test-rtt: dirs
@@ -125,8 +126,13 @@ test-rtt: dirs
 	$(CC) $(CXXFLAGS) $(RTT_PROTO_TEST_WARNINGS) $(PROTOBUF_CFLAGS) -I$(RTT_PROTO_GEN_DIR) tests/rtt_proto_roundtrip_test.cpp $(RTT_PROTO_TEST_CC) -o $(RTT_PROTO_ROUNDTRIP_TEST) $(if $(PROTOBUF_LIBS),$(PROTOBUF_LIBS),-lprotobuf)
 	$(RTT_PROTO_ROUNDTRIP_TEST)
 
+# 不依赖 Linux / root；parser/rate 断言可在 macOS 执行，Linux 额外检查真实 /proc/self。
+test-process-resources: dirs
+	$(CC) $(CXXFLAGS) -pthread -Iinclude tests/process_resource_sampler_test.cpp src/process_resource_sampler.cpp -o $(PROCESS_RESOURCE_SAMPLER_TEST)
+	$(PROCESS_RESOURCE_SAMPLER_TEST)
+
 # 不依赖 Linux/libbpf/root，验证 ABI、counter reset/continuity 和长连接策略。
-test-traffic-core: dirs
+test-traffic-core: dirs test-process-resources
 	$(CC) $(CXXFLAGS) -Iinclude tests/traffic_core_test.cpp -o $(TRAFFIC_CORE_TEST)
 	$(TRAFFIC_CORE_TEST)
 	$(CC) $(CXXFLAGS) -Iinclude tests/traffic_snapshot_test.cpp src/net_traffic.cpp -o $(TRAFFIC_SNAPSHOT_TEST) $(LIBBPF_TEST_LIBS)
@@ -139,7 +145,7 @@ test-traffic-core: dirs
 	$(SERVER_LIFECYCLE_CONTRACT_TEST)
 	$(CC) $(CXXFLAGS) -Iinclude tests/route_selection_test.cpp -o $(ROUTE_SELECTION_TEST)
 	$(ROUTE_SELECTION_TEST)
-	$(CC) $(CXXFLAGS) -pthread -Iinclude tests/server_context_lifecycle_test.cpp -o $(SERVER_CONTEXT_LIFECYCLE_TEST)
+	$(CC) $(CXXFLAGS) -pthread -Iinclude tests/server_context_lifecycle_test.cpp src/process_resource_sampler.cpp -o $(SERVER_CONTEXT_LIFECYCLE_TEST)
 	$(SERVER_CONTEXT_LIFECYCLE_TEST)
 	$(CC) $(CXXFLAGS) -pthread -Iinclude tests/traffic_observation_state_test.cpp -o $(TRAFFIC_OBSERVATION_STATE_TEST)
 	$(TRAFFIC_OBSERVATION_STATE_TEST)

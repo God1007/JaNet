@@ -113,6 +113,44 @@ export type TrafficObservationStatus = {
   recentEvents: TrafficObservationEvent[];
 };
 
+// 单个常驻进程的一次资源快照。所有可缺失指标都用 null 表达，避免把平台不支持误报为 0。
+export type ProcessResourceMetrics = {
+  component: string;
+  available: boolean;
+  sampledAt: number;
+  cpuPercent: number | null;
+  userCpuSeconds: number | null;
+  systemCpuSeconds: number | null;
+  residentMemoryBytes: number | null;
+  peakResidentMemoryBytes: number | null;
+  virtualMemoryBytes: number | null;
+  heapUsedBytes: number | null;
+  heapTotalBytes: number | null;
+  externalMemoryBytes: number | null;
+  arrayBufferBytes: number | null;
+  threadCount: number | null;
+  openFileDescriptors: number | null;
+  activeResources: number | null;
+  uptimeSeconds: number | null;
+  voluntaryContextSwitches: number | null;
+  involuntaryContextSwitches: number | null;
+  minorPageFaults: number | null;
+  majorPageFaults: number | null;
+  sampleWindowMs: number | null;
+  logicalCpuCount: number | null;
+  unavailableMetrics: string[];
+};
+
+// BFF 把 Linux engine 与本地 Dashboard 进程的采样合并，供同一时间轴比较开销。
+export type RuntimeResources = {
+  sampledAt: number;
+  cpuSemantics: string;
+  combinedResidentMemoryBytes: number | null;
+  combinedResidentMemoryComplete: boolean;
+  engine: ProcessResourceMetrics | null;
+  dashboard: ProcessResourceMetrics | null;
+};
+
 // Node BFF 对 GetNetworkSnapshot 的稳定规范化结果。
 export type NetworkSnapshot = {
   observedAt: number;
@@ -126,6 +164,18 @@ export type NetworkSnapshot = {
   interfaces: InterfaceSnapshot[];
   quality: NetworkQualitySummary;
   trafficObservation: TrafficObservationStatus;
+  engineResources: ProcessResourceMetrics | null;
+};
+
+// 资源趋势图的一次浏览器本地采样；null 会在图中保留为缺口而不是伪造零值。
+export type ResourceSample = {
+  timestamp: number;
+  time: string;
+  engineCpuPercent: number | null;
+  dashboardCpuPercent: number | null;
+  engineResidentMemoryBytes: number | null;
+  dashboardResidentMemoryBytes: number | null;
+  combinedResidentMemoryBytes: number | null;
 };
 
 // 流量趋势图的一次采样；累计计数器同时支持展示窗口增量。
@@ -179,6 +229,131 @@ export type HealthInfo = {
   missingMetrics: string[];
 };
 
+// Chrome webRequest 终态分为收到 HTTP 响应和浏览器网络错误；后者没有 HTTP 状态码。
+export type RequestFailureCategory =
+  | "http"
+  | "dns"
+  | "tls"
+  | "connection"
+  | "network"
+  | "cancelled"
+  | "policy";
+
+export type RequestFailureEvent = {
+  eventId: string;
+  occurredAt: number;
+  receivedAt: number;
+  timestampAdjusted?: boolean;
+  timestampTrusted?: boolean;
+  staleBacklog?: boolean;
+  terminal: "completed" | "error";
+  scheme: "http" | "https";
+  host: string;
+  port: string;
+  safeUrl: string;
+  method: string;
+  resourceType: string;
+  serverIp: string | null;
+  fromCache: boolean;
+  statusCode: number | null;
+  failureCode: string;
+  networkError: string | null;
+  category: RequestFailureCategory;
+  classificationAlertEligible?: boolean;
+  alertEligible: boolean;
+  alertEligibilityReason?: "eligible" | "classification_filtered" | "stale_backlog" | "untrusted_timestamp";
+};
+
+export type RequestFailureAlert = {
+  id: string;
+  state: "firing" | "resolved";
+  host: string;
+  failureCode: string;
+  statusCode: number | null;
+  networkError: string | null;
+  category: RequestFailureCategory;
+  threshold: number;
+  windowSeconds: number;
+  startedAt: number;
+  lastSeenAt: number;
+  countInWindow: number;
+  lastIp: string | null;
+  resourceType: string;
+  resolvedAt?: number;
+};
+
+export type RequestFailureValueCount = {
+  value: string;
+  count: number;
+  lastSeenAt: number;
+};
+
+export type RequestFailureGroup = {
+  host: string;
+  failureCode: string;
+  statusCode: number | null;
+  networkError: string | null;
+  category: RequestFailureCategory;
+  alertEligible: boolean;
+  totalCount: number;
+  countInWindow: number;
+  alertEligibleCountInWindow: number;
+  windowCountCapped: boolean;
+  windowOverflowCount: number;
+  ipEvictions: number;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  lastOccurredAt: number;
+  lastFailure: RequestFailureEvent;
+  ips: RequestFailureValueCount[];
+  resourceTypes: RequestFailureValueCount[];
+  activeAlert: RequestFailureAlert | null;
+};
+
+// BFF 仅保留有界的近期失败、分组和告警转换；浏览器不再复制一份长期历史。
+export type RequestFailureSnapshot = {
+  enabled: boolean;
+  source: string;
+  lastReceivedAt: number;
+  lastHeartbeatAt: number;
+  lastContactAt: number;
+  connectedRecent: boolean;
+  totalFailures: number;
+  windowSeconds: number;
+  threshold: number;
+  failuresInWindow: number;
+  failuresInWindowCapped?: boolean;
+  failuresInWindowOverflow?: number;
+  activeAlerts: RequestFailureAlert[];
+  recentFailures: RequestFailureEvent[];
+  byHost: Array<{
+    host: string;
+    totalCount: number;
+    countInWindow: number;
+    activeAlerts: number;
+    lastSeenAt: number;
+  }>;
+  byFailureCode: Array<{
+    failureCode: string;
+    category: RequestFailureCategory;
+    totalCount: number;
+    countInWindow: number;
+    activeAlerts: number;
+    lastSeenAt: number;
+  }>;
+  groups: RequestFailureGroup[];
+  alertTransitions: RequestFailureAlert[];
+  stats: {
+    duplicates: number;
+    rejected: number;
+    clientDropped: number;
+    groupEvictions: number;
+    recentSize: number;
+    groupSize: number;
+    dedupeSize: number;
+  };
+};
+
 export type EventTimelinePoint = {
   time: string;
   total: number;
@@ -208,6 +383,8 @@ export type Snapshot = {
   };
   interfaces: string[];
   networkSnapshot: NetworkSnapshot | null;
+  runtimeResources: RuntimeResources | null;
+  requestFailures: RequestFailureSnapshot | null;
   health: HealthInfo;
   pings: PingResult[];
   latencySeries: Array<{

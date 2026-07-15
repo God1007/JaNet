@@ -100,6 +100,7 @@ EOF
   Quick commands
     ./run-mac.sh                     Start JaNet without opening a browser
     ./run-mac.sh dashboard           Open the Web Dashboard when you need it
+    ./run-mac.sh browser-monitor     Open Chrome extension setup
     ./run-mac.sh status              Check stack health
     ./run-mac.sh logs                Show recent logs
     ./run-mac.sh follow              Follow live logs (Ctrl-C to stop)
@@ -110,7 +111,7 @@ EOF
     ./run-mac.sh stop                Stop JaNet
 
   Tip: append server/dashboard to focus one component; use -n N to choose history size.
-  Metrics describe the Lima VM network stack, not native macOS Wi-Fi.
+  Engine metrics describe Lima; the optional browser monitor observes host Chrome failures.
 
 EOF
 }
@@ -131,6 +132,7 @@ usage() {
 Usage:
   ./run-mac.sh [start] [options]
   ./run-mac.sh dashboard [options]
+  ./run-mac.sh browser-monitor [--no-open]
   ./run-mac.sh intro
   ./run-mac.sh setup [options]
   ./run-mac.sh stop [options]
@@ -178,7 +180,8 @@ Log modes:
 
 Boundary:
   Server metrics describe the Lima Linux VM network stack, not native macOS
-  en0, Wi-Fi RSSI, or all host traffic.
+  en0 or Wi-Fi RSSI. The optional browser monitor only observes real Chrome
+  HTTP(S) failure metadata; it is not system-wide host traffic capture.
 EOF
 }
 
@@ -881,10 +884,42 @@ summary() {
   ok "JaNet is running"
   printf '  gRPC:      127.0.0.1:%s -> Lima Linux\n' "$GRPC_PORT"
   ((WITH_DASHBOARD)) && printf '  Dashboard: http://127.0.0.1:%s\n' "$WEB_PORT"
+  ((WITH_DASHBOARD)) && printf '  Browser:   ./run-mac.sh browser-monitor  (optional real-request failures)\n'
   printf '  Logs:      ./run-mac.sh logs        (recent)\n'
   printf '  Live logs: ./run-mac.sh follow      (Ctrl-C to exit)\n'
   printf '  Stop:      ./run-mac.sh stop\n'
   warn "Metrics are from the Lima VM, not native macOS en0/Wi-Fi"
+}
+
+# 打开 Chrome 的 unpacked extension 管理页；浏览器安全模型不允许脚本替用户静默安装扩展。
+open_browser_monitor() {
+  local extension_dir="$REPO_ROOT/browser-extension"
+  [[ -f "$extension_dir/manifest.json" ]] \
+    || die "Browser monitor manifest is missing: $extension_dir/manifest.json"
+  API_PORT="$(saved_port api "$API_PORT")"
+
+  if ! dashboard_alive; then
+    warn "Dashboard BFF is not running; start JaNet before expecting browser failure delivery"
+  fi
+
+  printf 'JaNet browser request monitor\n'
+  printf '  1. Enable Developer mode in chrome://extensions\n'
+  printf '  2. Click Load unpacked and select:\n     %s\n' "$extension_dir"
+  if [[ "$API_PORT" == 5174 ]]; then
+    printf '  3. Keep the default options; a heartbeat should appear within 60s.\n'
+  else
+    printf '  3. In Extension options, set the local endpoint to http://127.0.0.1:%s/api/browser-failures.\n' "$API_PORT"
+  fi
+  printf '  Privacy: only failed request metadata is sent locally; no body, cookie, auth header, path, query or fragment.\n'
+
+  if ((OPEN_BROWSER)); then
+    command -v open >/dev/null 2>&1 || die "macOS open command is unavailable"
+    if open -a "Google Chrome" "chrome://extensions/" 2>/dev/null; then
+      ok "Opened Chrome extension setup"
+    else
+      warn "Google Chrome could not be opened automatically; visit chrome://extensions manually"
+    fi
+  fi
 }
 
 # 启动全栈；发现残缺的旧实例时先安全收敛。
@@ -1322,7 +1357,7 @@ run_demo() {
 # 解析动作与公共参数；剩余位置参数只交给 logs/test/demo。
 if (($#>0)); then
   case "$1" in
-    setup|start|dashboard|stop|restart|status|logs|follow|logs-follow|test|demo|intro|help) ACTION=$1; shift ;;
+    setup|start|dashboard|browser-monitor|stop|restart|status|logs|follow|logs-follow|test|demo|intro|help) ACTION=$1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) ;;
     *) die "Unknown action: $1" ;;
@@ -1384,6 +1419,7 @@ case "$ACTION" in
   setup) setup_all; ok "macOS/Lima environment is ready" ;;
   start) start_all ;;
   dashboard) open_dashboard ;;
+  browser-monitor) open_browser_monitor ;;
   stop) stop_all ;;
   restart) inherit_restart_ports; stop_all; start_all ;;
   status) show_status ;;
