@@ -557,7 +557,7 @@ sequenceDiagram
     else DNS/TCP/TLS or other terminal network failure
         Chrome-->>Ext: onErrorOccurred(error, optional ip, request metadata)
     end
-    Ext->>Ext: reduce URL to origin only; enqueue bounded event
+    Ext->>Ext: reduce URL to origin only and enqueue bounded event
     Ext->>BFF: POST /api/browser-failures
     BFF->>BFF: validate + dedupe + group by host/failureCode
     BFF-->>UI: failures, active alerts and filterable recent rows
