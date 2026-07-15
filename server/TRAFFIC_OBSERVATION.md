@@ -48,6 +48,28 @@ published monotonic/wall-clock boundary is the midpoint of the actual bounded
 map-read interval, so a slow process scan cannot shorten the elapsed time while
 its bytes are included in the counter delta.
 
+## User-space history retention
+
+`trafficHistory` is a short anomaly-baseline cache, not a historical database.
+Each flow keeps at most 60 BPS/PPS samples (about 10 minutes with the default
+10-second sampler), and only the most active bounded set is updated for each
+trustworthy generation. Idle entries expire after 30 minutes by default; if the
+cache is still over 4,096 keys, the least recently updated entries are evicted
+first. Entries updated in the current generation are protected from that pass,
+so capacity cleanup cannot delete the baseline being used to derive the same
+snapshot. Interface changes and Server restart clear the whole cache.
+
+Runtime bounds:
+
+```text
+WEAKNET_TRAFFIC_HISTORY_TTL_SEC=1800       # clamped to 60..86400
+WEAKNET_TRAFFIC_HISTORY_MAX_ENTRIES=4096  # clamped to 128..69632
+```
+
+The TTL sweep is normally once per minute and capacity overflow is handled
+immediately. Day/month queries belong in an external time-series database with
+retention and downsampling, not in this in-process map.
+
 ## Long-flow protection
 
 The 30-second `NETLINK_SOCK_DIAG` reconciliation inspects established IPv4 and

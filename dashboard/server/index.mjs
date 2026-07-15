@@ -16,6 +16,13 @@ import {
   normalizeDiagnosis
 } from "./diagnosis_contract.mjs";
 import { preferredMetricNumber } from "./metric_compat.mjs";
+import {
+  admitWebSocketConnection,
+  boundedInteger,
+  createConcurrencyGate,
+  createRetiringResourceTracker,
+  sendWebSocketMessage
+} from "./resource_guards.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dashboardRoot = path.resolve(__dirname, "..");
@@ -86,6 +93,22 @@ const pingTargets = (process.env.DASHBOARD_PING_TARGETS || "127.0.0.1,8.8.8.8,ba
   .split(",")
   .map((item) => item.trim())
   .filter(Boolean);
+// 长时运行保护采用小而明确的默认上限；需要时可通过环境变量调高，但仍保留硬上界。
+const analyzeMaxConcurrency = boundedInteger(
+  process.env.DASHBOARD_ANALYZE_MAX_CONCURRENCY,
+  2,
+  { min: 1, max: 32 }
+);
+const wsMaxConnections = boundedInteger(
+  process.env.DASHBOARD_WS_MAX_CONNECTIONS,
+  32,
+  { min: 1, max: 1024 }
+);
+const wsMaxBufferedBytes = boundedInteger(
+  process.env.DASHBOARD_WS_MAX_BUFFERED_BYTES,
+  256 * 1024,
+  { min: 16 * 1024, max: 16 * 1024 * 1024 }
+);
 
 // 根据显式 provider 或现有 Key 选择 AI 服务及默认模型。
 function resolveAiConfig() {
@@ -153,6 +176,14 @@ const packageDefinition = protoLoader.loadSync(protoPath, {
 });
 const proto = grpc.loadPackageDefinition(packageDefinition);
 const WeakNet = proto.weaknet.v1.WeakNet;
+// 主 client 切换时先进入 retiring，等现有 unary RPC 完成后再 close，避免打断在途请求。
+const grpcClients = createRetiringResourceTracker((grpcClient) => {
+  try {
+    grpcClient.close();
+  } catch (error) {
+    console.warn(`Failed to close gRPC client: ${error?.message || error}`);
+  }
+});
 let client = createWeakNetClient(grpcAddress);
 
 const app = express();
@@ -169,6 +200,9 @@ let streamStartedAt = 0;
 let streamCall = null;
 let reconnectTimer = null;
 let lastGrpcProbeAt = 0;
+let shuttingDown = false;
+const analyzeGate = createConcurrencyGate(analyzeMaxConcurrency);
+const activeRagChildren = new Set();
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
@@ -211,7 +245,7 @@ function grpcAddressCandidates() {
 
 // 为指定地址创建明文的本地 WeakNet gRPC 客户端。
 function createWeakNetClient(address) {
-  return new WeakNet(address, grpc.credentials.createInsecure());
+  return grpcClients.register(new WeakNet(address, grpc.credentials.createInsecure()));
 }
 
 // 统一生成毫秒级时间戳。
@@ -427,14 +461,23 @@ function rpcOnce(targetClient, method, request = {}, timeoutMs = 5000) {
   // gRPC 回调只负责把单次结果桥接到 Promise 的 resolve/reject。
   return new Promise((resolve, reject) => {
     const deadline = new Date(Date.now() + timeoutMs);
-    // 原生 gRPC 回调在错误时 reject，成功时只返回响应体。
-    targetClient[method](request, { deadline }, (error, response) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(response);
-    });
+    let releaseClient;
+    try {
+      // 记录在途调用，使地址切换只能在该 RPC 回调结束后关闭旧 client。
+      releaseClient = grpcClients.acquire(targetClient);
+      // 原生 gRPC 回调在错误时 reject，成功时只返回响应体。
+      targetClient[method](request, { deadline }, (error, response) => {
+        releaseClient();
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(response);
+      });
+    } catch (error) {
+      releaseClient?.();
+      reject(error);
+    }
   });
 }
 
@@ -459,11 +502,19 @@ async function rpcWithFallback(method, request = {}, timeoutMs = 5000, allowFall
 // 通过轻量 Get RPC 判断候选 gRPC 地址是否可达。
 async function probeGrpcAddress(address) {
   const probeClient = createWeakNetClient(address);
-  await rpcOnce(probeClient, "get", {}, 1600);
+  try {
+    await rpcOnce(probeClient, "get", {}, 1600);
+  } finally {
+    // 探测 client 不复用，无论成功、超时还是 RPC 失败都必须及时释放 channel。
+    grpcClients.retire(probeClient);
+  }
 }
 
 // 节流扫描候选地址；切换目标时同时取消旧事件流，促使其在新地址重连。
 async function selectReachableGrpcAddress(force = false) {
+  if (shuttingDown) {
+    return false;
+  }
   const current = Date.now();
   if (!force && current - lastGrpcProbeAt < 5000) {
     return false;
@@ -473,13 +524,22 @@ async function selectReachableGrpcAddress(force = false) {
   for (const candidate of grpcAddressCandidates()) {
     try {
       await probeGrpcAddress(candidate);
+      // 信号退出可能发生在探测等待期间；此时不再创建或切换任何主 client。
+      if (shuttingDown) {
+        return false;
+      }
       if (candidate !== grpcAddress) {
+        const oldClient = client;
+        const nextClient = createWeakNetClient(candidate);
         grpcAddress = candidate;
-        client = createWeakNetClient(grpcAddress);
+        client = nextClient;
         if (streamCall) {
-          streamCall.cancel();
+          const oldStreamCall = streamCall;
           streamCall = null;
+          oldStreamCall.cancel();
         }
+        // streaming 已取消；旧 client 的 unary RPC 若仍在执行，tracker 会等其回调后再 close。
+        grpcClients.retire(oldClient);
         streamError = "";
         console.log(`WeakNet dashboard switched gRPC target to ${grpcAddress}`);
       }
@@ -524,19 +584,17 @@ function rememberPing(ping) {
   }
 }
 
-// 将事件或连接状态广播给所有仍处于 OPEN 状态的浏览器 WebSocket。
+// 广播前实施待发送字节上限；慢客户端会被断开，避免单个页面拖出无界发送缓冲区。
 function broadcast(payload) {
   const message = JSON.stringify(payload);
   for (const socket of wss.clients) {
-    if (socket.readyState === socket.OPEN) {
-      socket.send(message);
-    }
+    sendWebSocketMessage(socket, message, wsMaxBufferedBytes);
   }
 }
 
 // 合并并发断流通知，确保五秒窗口内只安排一次重连。
 function scheduleEventReconnect() {
-  if (reconnectTimer) {
+  if (shuttingDown || reconnectTimer) {
     return;
   }
   // 定时器到期后清除占位，再重新建立 streaming，允许后续断流继续调度。
@@ -548,10 +606,17 @@ function scheduleEventReconnect() {
 
 // 建立 gRPC server-streaming，并把事件缓存后实时转发到浏览器。
 async function connectEventStream() {
+  if (shuttingDown) {
+    return;
+  }
   streamStartedAt = now();
   streamConnected = false;
   streamError = "";
   await selectReachableGrpcAddress();
+  // shutdown 可能发生在地址探测期间，返回后再次检查，避免退出过程中创建新 stream。
+  if (shuttingDown) {
+    return;
+  }
 
   let call;
   try {
@@ -751,6 +816,8 @@ async function collectSnapshot() {
     health,
     pings,
     latencySeries: pingHistory.slice(-120).map((item) => ({
+      // 保留原始毫秒时间戳，前端可以按真实采样顺序绘制，而不是依赖格式化后的时钟文本。
+      timestamp: item.timestamp,
       time: new Date(item.timestamp).toLocaleTimeString(),
       target: item.target,
       latencyMs: item.latencyMs,
@@ -780,15 +847,26 @@ function runRagBridge(networkSnapshot) {
       env: { ...process.env, PYTHONUNBUFFERED: "1" },
       stdio: ["pipe", "pipe", "pipe"]
     });
+    activeRagChildren.add(child);
     let stdout = "";
     let stderr = "";
     let settled = false;
     let timer = null;
 
-    const finish = (callback) => {
+    // 异常路径主动杀掉仍存活的 bridge，防止 stdin/pipe 错误留下孤儿 Python 进程。
+    const terminateChild = () => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+    };
+    const finish = (callback, { killChild = false } = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      activeRagChildren.delete(child);
+      if (killChild) {
+        terminateChild();
+      }
       callback();
     };
     const appendBounded = (current, chunk) => `${current}${chunk}`.slice(-1024 * 1024);
@@ -799,8 +877,10 @@ function runRagBridge(networkSnapshot) {
     child.stderr.on("data", (chunk) => {
       stderr = appendBounded(stderr, chunk);
     });
-    child.stdin.on("error", (error) => finish(() => reject(error)));
-    child.on("error", (error) => finish(() => reject(error)));
+    child.stdout.on("error", (error) => finish(() => reject(error), { killChild: true }));
+    child.stderr.on("error", (error) => finish(() => reject(error), { killChild: true }));
+    child.stdin.on("error", (error) => finish(() => reject(error), { killChild: true }));
+    child.on("error", (error) => finish(() => reject(error), { killChild: true }));
     child.on("close", (code) => {
       finish(() => {
         if (code !== 0) {
@@ -821,11 +901,17 @@ function runRagBridge(networkSnapshot) {
     });
 
     timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish(() => reject(new Error(`RAG bridge timed out after ${timeoutMs}ms`)));
+      finish(
+        () => reject(new Error(`RAG bridge timed out after ${timeoutMs}ms`)),
+        { killChild: true }
+      );
     }, timeoutMs);
 
-    child.stdin.end(`${JSON.stringify(networkSnapshot)}\n`);
+    try {
+      child.stdin.end(`${JSON.stringify(networkSnapshot)}\n`);
+    } catch (error) {
+      finish(() => reject(error), { killChild: true });
+    }
   });
 }
 
@@ -857,7 +943,16 @@ app.get("/api/status", (_request, response) => {
     ragBridgePath,
     streamConnected,
     streamError,
-    eventCount: eventBuffer.length
+    eventCount: eventBuffer.length,
+    analyzeConcurrency: {
+      active: analyzeGate.active,
+      limit: analyzeGate.limit
+    },
+    websocket: {
+      connections: wss.clients.size,
+      maxConnections: wsMaxConnections,
+      maxBufferedBytes: wsMaxBufferedBytes
+    }
   });
 });
 
@@ -884,6 +979,16 @@ app.post("/api/ping", async (request, response) => {
 
 // 重新采集最新证据后发起 AI 诊断，避免使用前端可篡改的 snapshot。
 app.post("/api/analyze", async (request, response) => {
+  // 不排队等待：达到上限立即返回 429，避免慢 AI 调用把请求和 Python 子进程堆进内存。
+  const releaseAnalyzeSlot = analyzeGate.tryAcquire();
+  if (!releaseAnalyzeSlot) {
+    response
+      .set("Retry-After", "1")
+      .status(429)
+      .json({ error: `too many concurrent analysis requests (limit=${analyzeGate.limit})` });
+    return;
+  }
+
   try {
     const snapshot = await collectSnapshot();
     const diagnosisConfig = {
@@ -903,19 +1008,75 @@ app.post("/api/analyze", async (request, response) => {
   } catch (error) {
     // 仅 snapshot 采集本身完全失败时返回错误；RAG 不可用会转为明确 degraded 响应。
     response.status(error.statusCode || 500).json({ error: compactError(error) });
+  } finally {
+    // success、degraded 和异常响应都释放槽位，保证并发计数不会永久占用。
+    releaseAnalyzeSlot();
   }
 });
 
 // 浏览器建立 WebSocket 时先发送 stream 状态和最近事件，缩短首屏空窗。
 wss.on("connection", (socket) => {
-  socket.send(
+  // error handler 必须先于限流判断安装；超限连接立即硬断开，不能滞留在 close 握手期。
+  if (!admitWebSocketConnection(socket, wss.clients.size, wsMaxConnections)) {
+    return;
+  }
+
+  sendWebSocketMessage(
+    socket,
     JSON.stringify({
       type: "hello",
       stream: { connected: streamConnected, error: streamError },
       recentEvents: eventBuffer.slice(-30)
-    })
+    }),
+    wsMaxBufferedBytes
   );
 });
+
+// 信号退出时停止重连、取消 stream、终止 bridge，并关闭主 client，避免后台资源遗留。
+function shutdown(signal) {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  console.log(`WeakNet dashboard received ${signal}, shutting down...`);
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (streamCall) {
+    const activeStream = streamCall;
+    streamCall = null;
+    activeStream.cancel();
+  }
+  grpcClients.retire(client);
+
+  for (const child of activeRagChildren) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+  }
+  activeRagChildren.clear();
+
+  for (const socket of wss.clients) {
+    socket.terminate();
+  }
+  wss.close();
+
+  const exitCleanly = () => process.exit(0);
+  if (server.listening) {
+    server.close(exitCleanly);
+  } else {
+    exitCleanly();
+  }
+
+  // 极端情况下仍给退出设置硬期限，避免系统 stop 命令永远等待。
+  const forceExitTimer = setTimeout(exitCleanly, 3000);
+  forceExitTimer.unref();
+}
+
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));
 
 // 启动顺序：探测 gRPC、建立事件流，最后监听本地 HTTP 端口。
 await selectReachableGrpcAddress(true);

@@ -10,7 +10,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "check": "tsc --noEmit && vite build",
-    "test:unit": "node --test server/metric_compat.test.mjs src/lib/rtt_format.test.mjs"
+    "test:unit": "node --test server/metric_compat.test.mjs server/resource_guards.test.mjs src/lib/rtt_format.test.mjs src/lib/traffic_metrics.test.mjs src/lib/latency_series.test.mjs src/lib/series_selection.test.mjs"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.13.4",

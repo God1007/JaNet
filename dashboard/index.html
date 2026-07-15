@@ -4,7 +4,29 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>WeakNet Observatory</title>
+    <meta name="theme-color" content="#080a0d" />
+    <meta name="description" content="JaNet real-time network diagnostics and traffic observability dashboard." />
+    <script>
+      (() => {
+        let theme = "dark";
+        try {
+          const saved = localStorage.getItem("janet-color-theme");
+          theme = saved === "light" || saved === "dark"
+            ? saved
+            : window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        } catch {
+          theme = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        }
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        document.querySelector('meta[name="theme-color"]').content = theme === "light" ? "#f5f7fa" : "#080a0d";
+      })();
+    </script>
+    <style>
+      html { background: #080a0d; }
+      html[data-theme="light"] { background: #f5f7fa; }
+    </style>
+    <title>JaNet Network Observatory</title>
   </head>
   <body>
     <div id="root"></div>
