@@ -1,0 +1,3 @@
+# 向量、manifest 和指针是由 release/migrate 命令从 raw knowledge 可复现生成的运行制品。
+*
+!.gitignore

@@ -1,0 +1,39 @@
+{
+  "schema_version": "2.0.0",
+  "kb_version": "1.0.1",
+  "description": "候选知识模板：draft 不能构建或发布，必须先完成人工审核。",
+  "entries": [
+    {
+      "entry_id": "net.example.metric_condition",
+      "metric": "example_metric",
+      "condition": "说明什么情况下该知识适用",
+      "threshold": {"operator": "ge", "value": 1},
+      "unit": "example-unit",
+      "symptoms": ["可观测的现象"],
+      "root_causes": ["已验证的潜在根因"],
+      "actions": ["可执行且可验收的处置动作"],
+      "severity": "medium",
+      "tags": ["candidate", "example"],
+      "source": "docs/or/code/path",
+      "source_revision": "sha256:replace-with-64-hex-file-digest",
+      "source_anchor": {
+        "symbol": "replace-with-stable-anchor-symbol",
+        "line_start": 1,
+        "line_end": 1,
+        "claim": "metric=example_metric; threshold=ge 1 example-unit",
+        "excerpt_sha256": "replace-with-64-hex-excerpt-digest",
+        "semantic_sha256": {
+          "condition": "replace-with-64-hex-normalized-condition-digest",
+          "symptoms": "replace-with-64-hex-normalized-symptoms-digest",
+          "root_causes": "replace-with-64-hex-normalized-root-causes-digest",
+          "actions": "replace-with-64-hex-normalized-actions-digest"
+        }
+      },
+      "updated_at": "2026-07-14T00:00:00Z",
+      "review_status": "draft",
+      "reviewed_by": null,
+      "reviewed_at": null,
+      "reviewed_by_human": false
+    }
+  ]
+}

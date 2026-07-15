@@ -1,0 +1,26 @@
+// Dashboard TypeScript 编译配置：启用严格检查，仅校验源码而不单独产出 JS。
+{
+  "compilerOptions": {
+    // 对齐现代浏览器和 Vite 的 ES module 构建目标。
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["DOM", "DOM.Iterable", "ES2020"],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    // 对前端状态、API 响应和组件属性执行完整严格类型检查。
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "module": "ESNext",
+    "moduleResolution": "Node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    // 实际打包交给 Vite；tsc 在检查脚本中只负责类型验证。
+    "noEmit": true,
+    "jsx": "react-jsx"
+  },
+  // 只纳入手写前端源码和对应全局声明。
+  "include": ["src"],
+  "references": []
+}

@@ -1,0 +1,10 @@
+# Dashboard 本地产物与敏感配置：避免提交依赖、构建结果和真实环境变量。
+# 包管理器依赖和 Vite 构建目录。
+node_modules/
+dist/
+# 可能包含真实 AI Key 的本地配置。
+.env
+.env.local
+# 本地验证产生的日志和截图。
+*.verify.*.log
+verify-*.png

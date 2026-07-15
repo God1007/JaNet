@@ -1,0 +1,46 @@
+# 仓库级忽略规则：排除本地环境变量、依赖缓存、Python 产物和运行日志。
+# 示例环境文件需要纳入版本控制，供部署方了解必填配置。
+
+# 本地环境与密钥配置；保留可公开的 .env.example。
+.env
+.env.*
+!.env.example
+
+# JavaScript/Python 依赖与解释器缓存。
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# 编辑器与操作系统生成文件。
+.DS_Store
+.idea/
+.vscode/
+
+# 运行期日志文件。
+*.log
+signal_changed.bin
+/get_reply.bin
+
+# Linux/Lima 构建产物；均由 Makefile、protoc、bpftool 或 run-mac.sh 重建。
+/server/build/
+/server/bin/
+/server/vmlinux.h
+/client/bin/
+/client/lib/
+/client/test_client
+*.o
+*.a
+*.so
+*.dylib
+
+# 压测结果带有机器、时间和负载相关数据，不作为源码提交。
+benchmark-results/
+
+# RAG 本地配置可能包含 API Key；索引和向量库均可从知识源重建。
+/AI-assisted analysis/config.json
+/AI-assisted analysis/network_knowledge_vectorstore_local/
+/AI-assisted analysis/network_knowledge_vectorstore/
+/AI-assisted analysis/vector_store/

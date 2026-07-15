@@ -1,0 +1,307 @@
+// WeakNet 对外协议：提供网络快照查询、主动 Ping 和网络事件订阅。
+// v1 包名用于隔离后续不兼容的协议演进。
+syntax = "proto3";
+
+package weaknet.v1;
+
+service WeakNet {
+  // 返回服务端的基础应答，主要用于最小连通性验证。
+  rpc Get(Empty) returns (GetReply);
+  // 查询服务端当前识别到的网络接口名称快照。
+  rpc GetInterfaces(Empty) returns (GetInterfacesReply);
+  // 一次性返回同一采样时刻的结构化接口指标与质量评估，供 Dashboard 和诊断服务直接消费。
+  rpc GetNetworkSnapshot(Empty) returns (NetworkSnapshot);
+  // 计算网络质量：无活动接口时回退到首个接口；无接口时仍返回 gRPC OK，details 中携带错误 JSON。
+  // 它不是标准 gRPC Health Checking 协议。
+  rpc HealthCheck(Empty) returns (HealthCheckReply);
+  // 经当前活动接口向指定主机执行一次 ICMP Ping。
+  rpc Ping(PingRequest) returns (PingReply);
+  // 建立服务端流式订阅；只推送订阅建立后的新事件，不主动发送当前状态快照。
+  rpc SubscribeEvents(EventRequest) returns (stream NetworkEvent);
+}
+
+// 无请求参数的 RPC 共用空消息，避免为每个方法重复定义空结构。
+message Empty {}
+
+// Get 的基础文本应答。
+message GetReply {
+  // 服务端返回的可读消息。
+  string message = 1;
+}
+
+// 当前网络接口名称列表的快照。
+message GetInterfacesReply {
+  // 接口名（例如 eth0、wlan0）；顺序与服务端采集顺序一致。
+  repeated string interfaces = 1;
+}
+
+// 指标是否有真实采样值；数值字段为 proto3 默认值时必须结合本状态判断。
+enum MetricAvailability {
+  // 未设置，调用方不得推断数值字段有效。
+  METRIC_AVAILABILITY_UNSPECIFIED = 0;
+  // 本轮快照已获得有效采样。
+  METRIC_AVAILABILITY_AVAILABLE = 1;
+  // 采集器未启动、不适用或本轮采样失败。
+  METRIC_AVAILABILITY_UNAVAILABLE = 2;
+}
+
+// 网络接口介质类型。
+enum InterfaceType {
+  INTERFACE_TYPE_UNSPECIFIED = 0;
+  INTERFACE_TYPE_ETHERNET = 1;
+  INTERFACE_TYPE_WIFI = 2;
+  INTERFACE_TYPE_CELLULAR = 3;
+}
+
+// 网络接口连通状态。
+enum InterfaceState {
+  INTERFACE_STATE_UNSPECIFIED = 0;
+  INTERFACE_STATE_UP = 1;
+  INTERFACE_STATE_DOWN = 2;
+}
+
+// 由 RTT 归纳的链路质量。
+enum LinkQuality {
+  LINK_QUALITY_UNSPECIFIED = 0;
+  LINK_QUALITY_GOOD = 1;
+  LINK_QUALITY_FAIR = 2;
+  LINK_QUALITY_POOR = 3;
+  LINK_QUALITY_BAD = 4;
+}
+
+// 综合质量评估等级。
+enum NetworkQualityLevel {
+  NETWORK_QUALITY_LEVEL_UNSPECIFIED = 0;
+  NETWORK_QUALITY_LEVEL_EXCELLENT = 1;
+  NETWORK_QUALITY_LEVEL_GOOD = 2;
+  NETWORK_QUALITY_LEVEL_FAIR = 3;
+  NETWORK_QUALITY_LEVEL_POOR = 4;
+}
+
+// 单个接口在同一快照时刻的结构化状态与指标。
+message InterfaceSnapshot {
+  string interface_name = 1;
+  bool is_default_route = 2;
+  InterfaceType interface_type = 3;
+  InterfaceState state = 4;
+  bool using_now = 5;
+  // 兼容旧客户端的整数毫秒字段；新客户端应读取 rtt_ms_precise。
+  int32 rtt_ms = 6 [deprecated = true];
+  // 兼容旧客户端的上一轮整数毫秒字段；新客户端应读取 previous_rtt_ms_precise。
+  int32 previous_rtt_ms = 7 [deprecated = true];
+  MetricAvailability rtt_availability = 8;
+  LinkQuality link_quality = 9;
+  int32 rssi_dbm = 10;
+  MetricAvailability rssi_availability = 11;
+  // 当前采集器提供的是 TCP 重传率代理值，不宣称为真实丢包率。
+  double tcp_retransmission_rate_percent = 12;
+  string tcp_retransmission_level = 13;
+  MetricAvailability tcp_retransmission_availability = 14;
+  uint64 traffic_bytes_per_second = 15;
+  uint64 traffic_packets_per_second = 16;
+  uint32 active_flows = 17;
+  MetricAvailability traffic_availability = 18;
+  // 精确 RTT，单位毫秒；optional presence 用于与只发送旧字段的服务端互通。
+  optional double rtt_ms_precise = 19;
+  // 上一次精确 RTT，单位毫秒；尚无上一轮成功采样时不设置。
+  optional double previous_rtt_ms_precise = 20;
+}
+
+// 对快照中活动接口执行的结构化综合质量评估。
+message NetworkQualitySummary {
+  NetworkQualityLevel level = 1;
+  double score = 2;
+  repeated string issues = 3;
+  // 任一核心指标不可用时为 true，提醒上层不要把分数当作完整观测结论。
+  bool degraded = 4;
+  repeated string missing_metrics = 5;
+}
+
+// eBPF map 的容量、读取完整性和连续性指标；任何 read_complete=false 的数值都不可当作真实零。
+message TrafficMapObservability {
+  uint64 lru_capacity = 1;
+  uint64 protected_capacity = 2;
+  uint64 lru_entries = 3;
+  uint64 protected_entries = 4;
+  uint64 disappeared_this_window = 5;
+  uint64 continuity_lost_this_window = 6;
+  uint64 counter_resets_this_window = 7;
+  uint64 policy_update_attempts = 8;
+  uint64 policy_update_failures = 9;
+  bool read_complete = 10;
+  uint64 lookup_misses = 11;
+  uint64 duplicate_keys = 12;
+  int32 read_error = 13;
+  uint64 lru_insert_failures = 14;
+  uint64 protected_insert_failures = 15;
+  uint64 interface_insert_failures = 16;
+  uint64 event_drops = 17;
+  repeated uint64 kernel_counters = 18;
+  uint64 packets_seen = 19;
+  uint64 interface_rejected = 20;
+  uint64 parse_failures = 21;
+  uint64 lru_lookup_misses = 22;
+  uint64 lru_insert_attempts = 23;
+  uint64 lru_insert_successes = 24;
+  uint64 protected_hits = 25;
+  uint64 protected_insert_attempts = 26;
+  uint64 protected_insert_successes = 27;
+  uint64 interface_insert_attempts = 28;
+  uint64 events_emitted = 29;
+  uint64 user_events_truncated = 30;
+}
+
+// 低频流量观测生命周期/可信度事件；枚举值与共享 flow ABI 对齐，只能追加。
+enum TrafficObservationEventType {
+  TRAFFIC_OBSERVATION_EVENT_UNSPECIFIED = 0;
+  TRAFFIC_OBSERVATION_EVENT_PROTECTED_PROMOTED = 1;
+  TRAFFIC_OBSERVATION_EVENT_MAP_INSERT_FAILURE = 2;
+  TRAFFIC_OBSERVATION_EVENT_CONTINUITY_LOST = 3;
+  TRAFFIC_OBSERVATION_EVENT_COUNTER_RESET = 4;
+  TRAFFIC_OBSERVATION_EVENT_SOCK_DIAG_DEGRADED = 5;
+  TRAFFIC_OBSERVATION_EVENT_PROTECTED_DEMOTED = 6;
+  TRAFFIC_OBSERVATION_EVENT_PROTECTED_CLOSED = 7;
+  TRAFFIC_OBSERVATION_EVENT_TRAFFIC_ANOMALY = 8;
+}
+
+message TrafficObservationEvent {
+  TrafficObservationEventType type = 1;
+  uint32 reason = 2;
+  uint64 socket_cookie = 3;
+  string flow_key = 4;
+  string description = 5;
+  int64 timestamp_unix_ms = 6;
+  uint64 generation = 7;
+  string anomaly_type = 8;
+  double severity = 9;
+}
+
+// eBPF 流量观测器的能力与采样代际，明确区分“真实零流量”和“采集不可用”。
+message TrafficObservationStatus {
+  MetricAvailability availability = 1;
+  bool valid = 2;
+  uint64 generation = 3;
+  int64 sampled_at_unix_ms = 4;
+  uint32 bound_ifindex = 5;
+  string capture_mode = 6;
+  string degraded_reason = 7;
+  bool libbpf_available = 8;
+  bool bpf_loaded = 9;
+  bool tc_ingress_attached = 10;
+  bool tc_egress_attached = 11;
+  bool tcp_kprobe_attached = 12;
+  bool udp_kprobe_attached = 13;
+  bool sock_diag_available = 14;
+  bool sock_diag_ipv4_available = 15;
+  bool sock_diag_ipv6_available = 16;
+  bool proc_owner_resolution = 17;
+  bool ipv4_supported = 18;
+  bool ipv6_supported = 19;
+  bool ipv6_extension_headers_supported = 20;
+  bool bidirectional = 21;
+  bool udp_interface_reliable = 22;
+  string sock_diag_status = 23;
+  string coverage_limitations = 24;
+  bool capture_complete = 25;
+  string capture_completeness = 26;
+  bool map_read_complete = 27;
+  TrafficMapObservability map_observability = 28;
+  repeated TrafficObservationEvent recent_events = 29;
+  bool baseline_only = 30;
+}
+
+// 供在线诊断链路使用的唯一结构化网络快照。
+message NetworkSnapshot {
+  int64 observed_at_unix_ms = 1;
+  repeated InterfaceSnapshot interfaces = 2;
+  bool has_active_interface = 3;
+  string active_interface = 4;
+  NetworkQualitySummary quality = 5;
+  TrafficObservationStatus traffic_observation = 6;
+  // 最近一次真实默认出口切换；服务端短时间保留，避免轮询先于诊断消费事件。
+  string previous_active_interface = 7;
+  bool default_route_changed = 8;
+  uint64 route_generation = 9;
+  int64 route_changed_at_unix_ms = 10;
+  string current_default_route_interface = 11;
+}
+
+// 当前网络质量评估结果。
+message HealthCheckReply {
+  // 服务端生成的详情字符串，当前实现为 JSON 文本。
+  string details = 1;
+}
+
+// 主动 Ping 请求。
+message PingRequest {
+  // 目标 IPv4 地址或可解析的主机名；不能为空。
+  string hostname = 1;
+}
+
+// 主动 Ping 结果；RPC 状态表示传输/前置条件，success 表示探测业务结果。
+message PingReply {
+  // ICMP 探测是否成功。
+  bool success = 1;
+  // 面向用户展示的完整结果文本，失败时也可能有值。
+  string result = 2;
+  // 探测失败的可读错误；成功时为空。
+  string error = 3;
+  // 兼容旧客户端的整数毫秒/负错误码字段；新客户端应读取 latency_ms_precise。
+  int32 latency_ms = 4 [deprecated = true];
+  // 本次探测绑定的本地网络接口名。
+  string interface_name = 5;
+  // 成功时的精确往返延迟，单位毫秒；失败时不设置。
+  optional double latency_ms_precise = 6;
+}
+
+// 可订阅的网络事件类别；数值是线上的稳定协议标识，只能追加不能复用。
+enum EventType {
+  // 未指定或无法识别的事件类型。
+  EVENT_TYPE_UNSPECIFIED = 0;
+  // 任意网络状态发生变化的通用事件。
+  EVENT_TYPE_CHANGED = 1;
+  // 可用接口集合发生变化。
+  EVENT_TYPE_INTERFACE_CHANGED = 2;
+  // 当前上网接口或连接方式发生变化。
+  EVENT_TYPE_CONNECTION_MODE_CHANGED = 3;
+  // 综合网络质量等级或分数发生变化。
+  EVENT_TYPE_NETWORK_QUALITY_CHANGED = 4;
+  // TCP 重传率代理值发生变化；名称中的 LOSS_RATE 为兼容既有字段，当前监控尚未直接产生此专用事件。
+  EVENT_TYPE_TCP_LOSS_RATE_CHANGED = 5;
+  // RTT 指标发生变化；当前 RTT 监控只发布通用 Changed，尚未直接产生此专用事件。
+  EVENT_TYPE_RTT_CHANGED = 6;
+  // Wi-Fi RSSI 指标发生变化；当前 RSSI 监控只发布通用 Changed，尚未直接产生此专用事件。
+  EVENT_TYPE_RSSI_CHANGED = 7;
+  // eBPF 流量观测低频生命周期/可信度事件；绝不对应逐包通知。
+  EVENT_TYPE_TRAFFIC_OBSERVATION = 8;
+}
+
+// 服务端流的订阅条件。
+message EventRequest {
+  // 需要接收的事件类型；空列表表示接收全部事件。
+  // 未识别值会被忽略；若过滤后集合为空，当前服务端同样按全部事件处理。
+  repeated EventType types = 1;
+}
+
+// 服务端向订阅者推送的一条网络事件。
+message NetworkEvent {
+  // 机器可判定的稳定事件枚举。
+  EventType type = 1;
+  // 兼容旧调用方的可读事件名，语义应与 type 保持一致。
+  string event_type = 2;
+  // 事件摘要；部分事件会包含来源前缀。
+  string message = 3;
+  // 事件生产模块或网络接口标识。
+  string source = 4;
+  // 可选扩展详情，当前部分事件使用 JSON 文本。
+  string details = 5;
+  // 诊断计数值；可能重复，不提供事件排序、连续性或唯一性保证。
+  int32 counter = 6;
+  // 事件优先级元数据；当前服务端不会据此调度、排序或选择丢弃对象。
+  int32 priority = 7;
+  // 事件产生时间，Unix Epoch 毫秒。
+  int64 timestamp_unix_ms = 8;
+  // 流量观测事件的结构化载荷；仅 type=EVENT_TYPE_TRAFFIC_OBSERVATION 时存在。
+  // details 仍保留作为旧客户端兼容字段，新客户端不应解析 JSON 来获取核心语义。
+  TrafficObservationEvent traffic_observation = 9;
+}

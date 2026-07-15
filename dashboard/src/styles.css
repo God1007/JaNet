@@ -1,0 +1,572 @@
+/* Dashboard 全局样式：定义暗色观测台主题、响应式布局、图表容器和交互状态。 */
+
+:root {
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  color: #edf3f1;
+  background: #0b0f12;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --bg: #0b0f12;
+  --panel: #11161c;
+  --panel-strong: #151d23;
+  --panel-soft: #0f1419;
+  --line: #27313b;
+  --muted: #8e9aa5;
+  --text: #edf3f1;
+  --accent: #63d471;
+  --accent-deep: #2d8b55;
+  --danger: #f07167;
+  --cyan: #48b8d0;
+  --radius: 8px;
+}
+
+/* 全局盒模型、页面背景和基础表单行为。 */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100dvh;
+  overflow-x: hidden;
+  background:
+    linear-gradient(140deg, rgba(99, 212, 113, 0.09), transparent 30%),
+    linear-gradient(215deg, rgba(72, 184, 208, 0.08), transparent 34%),
+    var(--bg);
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+/* 页面外壳、品牌标题和服务状态区。 */
+.app-shell {
+  width: calc(100% - 40px);
+  max-width: 1480px;
+  margin: 0 auto;
+  padding: 28px 0 48px;
+}
+
+.topbar {
+  min-height: 180px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 24px;
+  align-items: start;
+  padding: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(130deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.02)),
+    rgba(17, 22, 28, 0.86);
+  box-shadow: 0 28px 70px rgba(0, 0, 0, 0.26);
+}
+
+.topbar > div {
+  min-width: 0;
+}
+
+.product-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.mark-icon,
+.icon-button {
+  width: 38px;
+  height: 38px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: var(--radius);
+  background: rgba(99, 212, 113, 0.12);
+  color: var(--accent);
+}
+
+.topbar h1 {
+  max-width: 900px;
+  margin: 18px 0 12px;
+  font-size: clamp(38px, 5vw, 74px);
+  line-height: 0.95;
+  letter-spacing: 0;
+}
+
+.topbar p {
+  max-width: 760px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.status-cluster {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 0;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(12, 16, 20, 0.72);
+  color: #cdd6dd;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.status-pill i {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--danger);
+}
+
+.status-pill.ok i {
+  background: var(--accent);
+}
+
+.icon-button {
+  border: 1px solid rgba(99, 212, 113, 0.3);
+}
+
+.icon-button:active,
+.analysis-button:active,
+.probe-form button:active {
+  transform: translateY(1px);
+}
+
+/* 主内容栅格及所有观测面板的共享容器样式。 */
+.story-grid,
+.grid-two {
+  display: grid;
+  gap: 18px;
+  margin-top: 18px;
+}
+
+.story-grid {
+  grid-template-columns: 1.05fr 1.6fr 0.95fr;
+}
+
+.grid-two {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.quality-panel,
+.chart-panel,
+.interface-panel,
+.ops-panel,
+.ai-panel,
+.timeline-panel {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015)), var(--panel);
+  padding: 22px;
+  min-width: 0;
+}
+
+.wide {
+  min-width: 0;
+}
+
+.panel-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.panel-heading svg {
+  color: var(--accent);
+}
+
+.quiet-label {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.panel-heading h2 {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.15;
+}
+
+/* 质量分数环形仪表和底部指标摘要。 */
+.quality-orbit {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: min(100%, 230px);
+  margin: 6px auto 22px;
+}
+
+.quality-orbit svg {
+  width: 100%;
+  transform: rotate(-90deg);
+}
+
+.orbit-track,
+.orbit-value {
+  fill: none;
+  stroke-width: 10;
+}
+
+.orbit-track {
+  stroke: rgba(255, 255, 255, 0.08);
+}
+
+.orbit-value {
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-dasharray: 326;
+  transition: stroke-dashoffset 450ms ease;
+}
+
+.quality-orbit > div {
+  position: absolute;
+  display: grid;
+  place-items: center;
+}
+
+.quality-orbit strong {
+  font-size: 48px;
+  line-height: 1;
+}
+
+.quality-orbit span {
+  color: var(--muted);
+}
+
+.metric-rail {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.metric-rail div {
+  min-height: 74px;
+  padding: 12px;
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.metric-rail span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
+.metric-rail strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+/* 接口列表和事件图例。 */
+.interface-list {
+  display: grid;
+  gap: 10px;
+}
+
+.interface-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+}
+
+.interface-row svg {
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.legend-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.legend-list span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  color: #dbe4ea;
+  font-size: 12px;
+}
+
+.legend-list i {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+}
+
+/* 手动 Ping 表单和 AI 分析操作区。 */
+.probe-form {
+  margin-bottom: 18px;
+}
+
+.probe-form label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.probe-form div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.probe-form input {
+  min-width: 0;
+  height: 42px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #0c1116;
+  color: var(--text);
+  padding: 0 12px;
+  outline: none;
+}
+
+.probe-form input:focus {
+  border-color: rgba(99, 212, 113, 0.7);
+  box-shadow: 0 0 0 3px rgba(99, 212, 113, 0.14);
+}
+
+.probe-form button,
+.analysis-button {
+  height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: #061108;
+  font-weight: 800;
+  padding: 0 16px;
+  white-space: nowrap;
+}
+
+.ai-panel p {
+  margin: 0 0 16px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.analysis-output {
+  min-height: 220px;
+  max-height: 360px;
+  overflow: auto;
+  margin: 16px 0 0;
+  padding: 16px;
+  border-radius: var(--radius);
+  background: #0b1015;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  color: #dce8df;
+  white-space: pre-wrap;
+  line-height: 1.55;
+}
+
+/* 实时事件时间线、错误提示和空状态。 */
+.timeline-panel {
+  margin-top: 18px;
+}
+
+.event-table {
+  display: grid;
+  gap: 8px;
+}
+
+.event-row {
+  display: grid;
+  grid-template-columns: 96px 210px minmax(0, 1fr) 130px;
+  gap: 14px;
+  align-items: center;
+  min-height: 50px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  border: 1px solid rgba(255, 255, 255, 0.055);
+}
+
+.event-row span,
+.event-row em {
+  color: var(--muted);
+  font-style: normal;
+  font-size: 12px;
+}
+
+.event-row strong {
+  color: var(--accent);
+  overflow-wrap: anywhere;
+}
+
+.event-row p {
+  margin: 0;
+  color: #d7e0e5;
+  overflow-wrap: anywhere;
+}
+
+.notice {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(240, 113, 103, 0.32);
+  background: rgba(240, 113, 103, 0.11);
+  color: #ffd2ce;
+}
+
+.notice.compact {
+  margin-top: 14px;
+}
+
+.empty-line {
+  min-height: 46px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius);
+  color: var(--muted);
+}
+
+/* 首屏骨架与加载动画，同时尊重系统减少动态效果设置。 */
+.skeleton-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  margin-top: 18px;
+}
+
+.skeleton-grid div {
+  height: 320px;
+  border-radius: var(--radius);
+  background:
+    linear-gradient(100deg, transparent 25%, rgba(255, 255, 255, 0.06) 40%, transparent 55%),
+    var(--panel);
+  background-size: 240% 100%;
+  animation: shimmer 1.8s ease-in-out infinite;
+}
+
+.spin {
+  animation: rotate 0.9s linear infinite;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -120% 0;
+  }
+}
+
+@keyframes rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* 中窄屏将多列观测区收敛为单列。 */
+@media (max-width: 1180px) {
+  .story-grid,
+  .grid-two {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    grid-template-columns: 1fr;
+  }
+
+  .status-cluster {
+    justify-content: flex-start;
+  }
+}
+
+/* 手机屏幕进一步压缩间距，并把表格和表单改为纵向布局。 */
+@media (max-width: 720px) {
+  .app-shell {
+    width: auto;
+    max-width: 1480px;
+    margin: 0 12px;
+    padding-top: 12px;
+  }
+
+  .topbar,
+  .quality-panel,
+  .chart-panel,
+  .interface-panel,
+  .ops-panel,
+  .ai-panel,
+  .timeline-panel {
+    padding: 16px;
+  }
+
+  .topbar h1 {
+    max-width: 100%;
+    font-size: 32px;
+    line-height: 1;
+    overflow-wrap: break-word;
+  }
+
+  .metric-rail,
+  .skeleton-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .event-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .probe-form div {
+    grid-template-columns: 1fr;
+  }
+}

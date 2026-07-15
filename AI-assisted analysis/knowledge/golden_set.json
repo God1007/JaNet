@@ -1,0 +1,129 @@
+{
+  "schema_version": "1.0.0",
+  "description": "WeakNet 本地检索发布门禁；用于防止切词、向量和知识改动导致核心问题退化。",
+  "top_k": 4,
+  "min_score": 0.08,
+  "gates": {
+    "recall_at_4": 1.0,
+    "mrr_at_4": 0.85,
+    "citation_support_rate": 1.0,
+    "diagnosis_accuracy": 0.85
+  },
+  "cases": [
+    {
+      "case_id": "high-rtt",
+      "query": "RTT 往返时延持续 75ms，页面响应慢，如何排查链路拥塞",
+      "expected_entry_ids": ["net.rtt.high"],
+      "snapshot": {
+        "hasActiveInterface": true,
+        "activeInterface": "eth0",
+        "interfaces": [{"interfaceName": "eth0", "state": "UP", "usingNow": true, "rttMs": 75}]
+      },
+      "expected_status": "unhealthy",
+      "expected_diagnosis_entry_ids": ["net.rtt.high"],
+      "expected_evidence_entry_ids": ["net.rtt.high"]
+    },
+    {
+      "case_id": "tcp-retransmission",
+      "query": "TCP 重传代理比率 2% 导致吞吐下降，丢包和拥塞怎么验证",
+      "expected_entry_ids": ["net.tcp.retransmission_elevated"],
+      "snapshot": {
+        "hasActiveInterface": true,
+        "activeInterface": "eth0",
+        "interfaces": [{"interfaceName": "eth0", "state": "UP", "usingNow": true, "tcpRetransmissionRatePercent": 2.0}]
+      },
+      "expected_status": "unhealthy",
+      "expected_diagnosis_entry_ids": ["net.tcp.retransmission_elevated"],
+      "expected_evidence_entry_ids": ["net.tcp.retransmission_elevated"]
+    },
+    {
+      "case_id": "weak-wifi",
+      "query": "WiFi RSSI -75dBm 信号弱，重传和时延波动，检查无线干扰",
+      "expected_entry_ids": ["net.wifi.rssi_weak"],
+      "snapshot": {
+        "hasActiveInterface": true,
+        "activeInterface": "wlan0",
+        "interfaces": [{"interfaceName": "wlan0", "state": "UP", "usingNow": true, "rssiDbm": -75}]
+      },
+      "expected_status": "unhealthy",
+      "expected_diagnosis_entry_ids": ["net.wifi.rssi_weak"],
+      "expected_evidence_entry_ids": ["net.wifi.rssi_weak"]
+    },
+    {
+      "case_id": "interface-down",
+      "query": "当前上行网络接口 down，默认路由不可用，检查 carrier 和 operstate",
+      "expected_entry_ids": ["net.interface.down"],
+      "snapshot": {
+        "hasActiveInterface": true,
+        "activeInterface": "eth0",
+        "interfaces": [{"interfaceName": "eth0", "state": "DOWN", "usingNow": true}]
+      },
+      "expected_status": "unhealthy",
+      "expected_diagnosis_entry_ids": ["net.interface.down"],
+      "expected_evidence_entry_ids": ["net.interface.down"]
+    },
+    {
+      "case_id": "zero-traffic",
+      "query": "业务正在发请求但流量为零，怀疑 eBPF 未挂载或监控错误接口",
+      "expected_entry_ids": ["net.traffic.zero"],
+      "snapshot": {
+        "hasActiveInterface": true,
+        "activeInterface": "eth0",
+        "interfaces": [{"interfaceName": "eth0", "state": "UP", "usingNow": true, "trafficBytesPerSecond": 0, "activeFlows": 3, "trafficAvailability": "AVAILABLE"}],
+        "trafficObservation": {"availability": "AVAILABLE", "valid": true}
+      },
+      "expected_status": "unhealthy",
+      "expected_diagnosis_entry_ids": ["net.traffic.zero"],
+      "expected_evidence_entry_ids": ["net.traffic.zero"]
+    },
+    {
+      "case_id": "ebpf-unavailable",
+      "query": "eBPF 流量采集器 unavailable，BPF load attach 失败，流级证据缺失不能用零值替代",
+      "expected_entry_ids": ["net.ebpf.collector_unavailable"],
+      "snapshot": {
+        "hasActiveInterface": true,
+        "activeInterface": "eth0",
+        "interfaces": [{"interfaceName": "eth0", "state": "UP", "usingNow": true}],
+        "trafficObservation": {"availability": "UNAVAILABLE", "valid": false, "bpfLoaded": false}
+      },
+      "expected_status": "degraded",
+      "expected_diagnosis_entry_ids": ["net.ebpf.collector_unavailable"],
+      "expected_evidence_entry_ids": ["net.ebpf.collector_unavailable"]
+    },
+    {
+      "case_id": "multi-interface-default-route-switch",
+      "query": "多网卡从 wlan0 切换到 eth0，默认路由 default route changed，需要用 ifindex 重绑采集并保留历史",
+      "expected_entry_ids": ["net.interface.default_route_switched"],
+      "snapshot": {
+        "hasActiveInterface": true,
+        "activeInterface": "eth0",
+        "currentDefaultRouteInterface": "eth0",
+        "previousActiveInterface": "wlan0",
+        "defaultRouteChanged": true,
+        "routeGeneration": 2,
+        "routeChangedAtUnixMs": 1784000000000,
+        "interfaces": [
+          {"interfaceName": "eth0", "state": "UP", "usingNow": true, "isDefaultRoute": true},
+          {"interfaceName": "wlan0", "state": "UP", "usingNow": false, "isDefaultRoute": false}
+        ]
+      },
+      "expected_status": "degraded",
+      "expected_diagnosis_entry_ids": ["net.interface.default_route_switched"],
+      "expected_evidence_entry_ids": ["net.interface.default_route_switched"]
+    },
+    {
+      "case_id": "healthy-normal-observation",
+      "query": "RTT 往返时延 75ms 的高延迟知识如何排查",
+      "expected_entry_ids": ["net.rtt.high"],
+      "snapshot": {
+        "hasActiveInterface": true,
+        "activeInterface": "eth0",
+        "interfaces": [{"interfaceName": "eth0", "state": "UP", "usingNow": true, "rttMs": 20, "rssiDbm": -50, "tcpRetransmissionRatePercent": 0.0, "trafficBytesPerSecond": 1024}],
+        "trafficObservation": {"availability": "AVAILABLE", "valid": true}
+      },
+      "expected_status": "healthy",
+      "expected_diagnosis_entry_ids": [],
+      "expected_evidence_entry_ids": []
+    }
+  ]
+}
