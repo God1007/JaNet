@@ -816,7 +816,8 @@ PY
     sleep .1
   done
   [[ "$pgid" == "$pid" ]] || die "Dashboard did not create an independent process group"
-  for ((i=0; i<150; i=i+1)); do
+  # A cold Node/Vite start on a Windows-mounted WSL filesystem can exceed 15 seconds.
+  for ((i=0; i<600; i=i+1)); do
     dashboard_http_ready && break
     sleep .1
   done
