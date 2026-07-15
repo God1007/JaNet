@@ -4,6 +4,8 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -14,6 +16,90 @@
 #include "flow_abi.h"
 
 namespace weaknet_grpc::traffic_core {
+
+// 用户态 flow 历史只服务于短窗口异常判定，不能随着短连接 churn 永久保留。
+// 默认值覆盖 60 个 10 秒样本后的短暂空闲期；硬上限拒绝把配置误设成“近似无限”。
+inline constexpr std::uint64_t kDefaultFlowHistoryTtlSeconds = 30 * 60;
+inline constexpr std::uint64_t kMinFlowHistoryTtlSeconds = 60;
+inline constexpr std::uint64_t kMaxFlowHistoryTtlSeconds = 24 * 60 * 60;
+inline constexpr std::size_t kDefaultFlowHistoryMaxEntries = 4096;
+inline constexpr std::size_t kMinFlowHistoryMaxEntries = 128;
+inline constexpr std::size_t kMaxFlowHistoryMaxEntries =
+    FLOW_LRU_MAX_ENTRIES + FLOW_PROTECTED_MAX_ENTRIES;
+
+struct FlowHistoryRetentionPolicy {
+    std::chrono::seconds ttl{kDefaultFlowHistoryTtlSeconds};
+    std::size_t max_entries = kDefaultFlowHistoryMaxEntries;
+};
+
+// 环境变量先由调用方解析成无符号整数，再在这里统一夹紧到可运维的安全区间。
+inline FlowHistoryRetentionPolicy normalizeFlowHistoryRetentionPolicy(
+    std::uint64_t ttl_seconds,
+    std::uint64_t max_entries) noexcept {
+    FlowHistoryRetentionPolicy policy;
+    policy.ttl = std::chrono::seconds(std::clamp(
+        ttl_seconds, kMinFlowHistoryTtlSeconds, kMaxFlowHistoryTtlSeconds));
+    policy.max_entries = static_cast<std::size_t>(std::clamp<std::uint64_t>(
+        max_entries, kMinFlowHistoryMaxEntries, kMaxFlowHistoryMaxEntries));
+    return policy;
+}
+
+struct FlowHistoryPruneResult {
+    std::size_t ttl_evictions = 0;
+    std::size_t capacity_evictions = 0;
+};
+
+// 使用 TrafficHistory::lastUpdate 做 TTL 与最老优先淘汰。
+// protected_keys 是调用方选出的本轮有界活跃集合；helper 宁可暂时超额，也不删除刚形成的基线。
+// TTL 扫描为 O(n)；仅超容量时才做 O(n) 选择和 O(k log n) 删除，避免维护侵入式 LRU 索引。
+template <typename HistoryMap, typename ProtectedKeys>
+inline FlowHistoryPruneResult pruneFlowHistory(
+    HistoryMap& history,
+    std::chrono::system_clock::time_point now,
+    const FlowHistoryRetentionPolicy& policy,
+    const ProtectedKeys& protected_keys) {
+    FlowHistoryPruneResult result;
+    const auto isProtected = [&](const auto& key) {
+        return protected_keys.find(key) != protected_keys.end();
+    };
+
+    for (auto it = history.begin(); it != history.end();) {
+        const auto lastUpdate = it->second.lastUpdate;
+        const bool timestampMissing = lastUpdate.time_since_epoch().count() == 0;
+        const bool expired = timestampMissing ||
+            (now > lastUpdate && now - lastUpdate > policy.ttl);
+        if (!isProtected(it->first) && expired) {
+            it = history.erase(it);
+            ++result.ttl_evictions;
+        } else {
+            ++it;
+        }
+    }
+
+    if (history.size() <= policy.max_entries) return result;
+
+    using Candidate = std::pair<std::chrono::system_clock::time_point, std::string>;
+    std::vector<Candidate> candidates;
+    candidates.reserve(history.size());
+    for (const auto& [key, value] : history) {
+        if (!isProtected(key)) candidates.emplace_back(value.lastUpdate, key);
+    }
+
+    const std::size_t requested = history.size() - policy.max_entries;
+    const std::size_t evictCount = std::min(requested, candidates.size());
+    const auto olderFirst = [](const Candidate& left, const Candidate& right) {
+        if (left.first != right.first) return left.first < right.first;
+        return left.second < right.second;
+    };
+    if (evictCount < candidates.size()) {
+        std::nth_element(candidates.begin(), candidates.begin() + evictCount,
+                         candidates.end(), olderFirst);
+    }
+    for (std::size_t index = 0; index < evictCount; ++index) {
+        result.capacity_evictions += history.erase(candidates[index].second);
+    }
+    return result;
+}
 
 // 某个 map 条目在一次采样边界上的累计计数和身份代次，用于与上一轮安全求差。
 struct CounterSample {

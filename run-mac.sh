@@ -18,6 +18,11 @@ WEB_PORT="${DASHBOARD_WEB_PORT:-5173}"
 API_PORT="${DASHBOARD_API_PORT:-5174}"
 BUILD_JOBS="${WEAKNET_BUILD_JOBS:-2}"
 BUILD_VERBOSE="${WEAKNET_BUILD_VERBOSE:-0}"
+SERVER_LOG_MAX_MB="${WEAKNET_SERVER_LOG_MAX_MB:-10}"
+SERVER_LOG_BACKUPS="${WEAKNET_SERVER_LOG_BACKUPS:-5}"
+SERVER_LOG_MAX_BYTES=""
+TRAFFIC_HISTORY_TTL_SEC="${WEAKNET_TRAFFIC_HISTORY_TTL_SEC:-1800}"
+TRAFFIC_HISTORY_MAX_ENTRIES="${WEAKNET_TRAFFIC_HISTORY_MAX_ENTRIES:-4096}"
 GRPC_PORT_EXPLICIT=0
 WEB_PORT_EXPLICIT=0
 API_PORT_EXPLICIT=0
@@ -93,13 +98,15 @@ EOF
   printf '%b  Linux engine in Lima · Dashboard on macOS · gRPC at the core%b\n\n' "$dim" "$reset"
   cat <<'EOF'
   Quick commands
-    ./run-mac.sh                     Start JaNet
+    ./run-mac.sh                     Start JaNet without opening a browser
+    ./run-mac.sh dashboard           Open the Web Dashboard when you need it
     ./run-mac.sh status              Check stack health
     ./run-mac.sh logs                Show recent logs
     ./run-mac.sh follow              Follow live logs (Ctrl-C to stop)
     ./run-mac.sh test health         Verify the diagnosis path
     ./run-mac.sh test ping 8.8.8.8   Run an active probe
     ./run-mac.sh demo                Simulate traffic and show observed data
+    ./run-mac.sh demo tcp-failure    Simulate failed TCP handshakes
     ./run-mac.sh stop                Stop JaNet
 
   Tip: append server/dashboard to focus one component; use -n N to choose history size.
@@ -123,6 +130,7 @@ usage() {
   cat <<'EOF'
 Usage:
   ./run-mac.sh [start] [options]
+  ./run-mac.sh dashboard [options]
   ./run-mac.sh intro
   ./run-mac.sh setup [options]
   ./run-mac.sh stop [options]
@@ -132,7 +140,7 @@ Usage:
   ./run-mac.sh follow [all|server|dashboard] [-n LINES]
   ./run-mac.sh logs -f [all|server|dashboard] [-n LINES]
   ./run-mac.sh test [get|health|ping HOST|all|events]
-  ./run-mac.sh demo [showcase|download|upload|burst|connections|mixed]
+  ./run-mac.sh demo [showcase|download|upload|burst|connections|mixed|tcp-failure]
 
 Options:
   --vm NAME
@@ -154,6 +162,13 @@ Environment:
   WEAKNET_LIMA_VM, WEAKNET_GRPC_PORT, WEAKNET_MAC_PYTHON, WEAKNET_NODE
   WEAKNET_RAG_PYTHON, DASHBOARD_PING_TARGETS, WEAKNET_BUILD_JOBS
   WEAKNET_BUILD_VERBOSE=0|1 (1 prints full compiler commands)
+  WEAKNET_SERVER_LOG_MAX_MB (1..1024, default 10)
+  WEAKNET_SERVER_LOG_BACKUPS (1..50, default 5)
+  WEAKNET_TRAFFIC_HISTORY_TTL_SEC (60..86400, default 1800)
+  WEAKNET_TRAFFIC_HISTORY_MAX_ENTRIES (128..69632, default 4096)
+  DASHBOARD_ANALYZE_MAX_CONCURRENCY (1..32, default 2)
+  DASHBOARD_WS_MAX_CONNECTIONS (1..1024, default 32)
+  DASHBOARD_WS_MAX_BUFFERED_BYTES (16384..16777216, default 262144)
   WEAKNET_DEMO_DURATION (same as demo --duration)
   WEAKNET_LOG_LINES, WEAKNET_BANNER=auto|always|never, NO_COLOR
 
@@ -198,6 +213,39 @@ init_paths() {
   ((10#$BUILD_JOBS >= 1)) || die "WEAKNET_BUILD_JOBS must be a positive integer"
   [[ "$BUILD_VERBOSE" == 0 || "$BUILD_VERBOSE" == 1 ]] \
     || die "WEAKNET_BUILD_VERBOSE must be 0 or 1"
+  case "$SERVER_LOG_MAX_MB" in
+    ""|*[!0-9]*) die "WEAKNET_SERVER_LOG_MAX_MB must be an integer in [1, 1024]" ;;
+  esac
+  ((${#SERVER_LOG_MAX_MB} <= 4)) \
+    || die "WEAKNET_SERVER_LOG_MAX_MB must be in [1, 1024]"
+  SERVER_LOG_MAX_MB=$((10#$SERVER_LOG_MAX_MB))
+  ((SERVER_LOG_MAX_MB >= 1 && SERVER_LOG_MAX_MB <= 1024)) \
+    || die "WEAKNET_SERVER_LOG_MAX_MB must be in [1, 1024]"
+  case "$SERVER_LOG_BACKUPS" in
+    ""|*[!0-9]*) die "WEAKNET_SERVER_LOG_BACKUPS must be an integer in [1, 50]" ;;
+  esac
+  ((${#SERVER_LOG_BACKUPS} <= 2)) \
+    || die "WEAKNET_SERVER_LOG_BACKUPS must be in [1, 50]"
+  SERVER_LOG_BACKUPS=$((10#$SERVER_LOG_BACKUPS))
+  ((SERVER_LOG_BACKUPS >= 1 && SERVER_LOG_BACKUPS <= 50)) \
+    || die "WEAKNET_SERVER_LOG_BACKUPS must be in [1, 50]"
+  case "$TRAFFIC_HISTORY_TTL_SEC" in
+    ""|*[!0-9]*) die "WEAKNET_TRAFFIC_HISTORY_TTL_SEC must be an integer in [60, 86400]" ;;
+  esac
+  ((${#TRAFFIC_HISTORY_TTL_SEC} <= 5)) \
+    || die "WEAKNET_TRAFFIC_HISTORY_TTL_SEC must be in [60, 86400]"
+  TRAFFIC_HISTORY_TTL_SEC=$((10#$TRAFFIC_HISTORY_TTL_SEC))
+  ((TRAFFIC_HISTORY_TTL_SEC >= 60 && TRAFFIC_HISTORY_TTL_SEC <= 86400)) \
+    || die "WEAKNET_TRAFFIC_HISTORY_TTL_SEC must be in [60, 86400]"
+  case "$TRAFFIC_HISTORY_MAX_ENTRIES" in
+    ""|*[!0-9]*) die "WEAKNET_TRAFFIC_HISTORY_MAX_ENTRIES must be an integer in [128, 69632]" ;;
+  esac
+  ((${#TRAFFIC_HISTORY_MAX_ENTRIES} <= 5)) \
+    || die "WEAKNET_TRAFFIC_HISTORY_MAX_ENTRIES must be in [128, 69632]"
+  TRAFFIC_HISTORY_MAX_ENTRIES=$((10#$TRAFFIC_HISTORY_MAX_ENTRIES))
+  ((TRAFFIC_HISTORY_MAX_ENTRIES >= 128 && TRAFFIC_HISTORY_MAX_ENTRIES <= 69632)) \
+    || die "WEAKNET_TRAFFIC_HISTORY_MAX_ENTRIES must be in [128, 69632]"
+  SERVER_LOG_MAX_BYTES=$((SERVER_LOG_MAX_MB * 1024 * 1024))
   # 去掉前导零后再比较/传递，避免相同端口以不同字符串绕过冲突检查。
   GRPC_PORT=$((10#$GRPC_PORT))
   WEB_PORT=$((10#$WEB_PORT))
@@ -475,7 +523,8 @@ test "$pid" = "$pgid"
 ' sh "$REMOTE_ROOT" >/dev/null 2>&1
 }
 
-# 安全停止 guest Server 进程组，TERM 超时后才 KILL。
+# 正常停止只向 C++ leader 发 TERM：它完成 TC/eBPF 清理并关闭 stdout 后，日志
+# 轮转器会排空管道、收到 EOF 并自然退出。只有整个进程组超时才一起 KILL。
 stop_server() {
   [[ -n "$PYTHON_BIN" ]] || return 0
   [[ "$(vm_status)" == Running ]] || return 0
@@ -490,9 +539,9 @@ actual=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
 test -n "$expected" && test "$actual" = "$expected" || exit 2
 pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d "[:space:]")
 test "$pid" = "$pgid" || { rm -f "$file"; exit 0; }
-/bin/kill -TERM -- "-$pgid" >/dev/null 2>&1 || true
+/bin/kill -TERM -- "$pid" >/dev/null 2>&1 || true
 i=0
-while /bin/kill -0 -- "-$pgid" >/dev/null 2>&1 && test "$i" -lt 50; do sleep .1; i=$((i+1)); done
+while /bin/kill -0 -- "-$pgid" >/dev/null 2>&1 && test "$i" -lt 100; do sleep .1; i=$((i+1)); done
 /bin/kill -KILL -- "-$pgid" >/dev/null 2>&1 || true
 i=0
 while /bin/kill -0 -- "-$pgid" >/dev/null 2>&1 && test "$i" -lt 20; do sleep .1; i=$((i+1)); done
@@ -664,31 +713,72 @@ except OSError: raise SystemExit(1)
 ' "$GRPC_PORT" >/dev/null 2>&1
 }
 
+# 按“最旧归档 -> 当前文件”的顺序合并后再截取，避免刚轮转时 logs 只看到空的新文件。
+tail_server_log() {
+  local lines=$1
+  limactl shell "$VM_NAME" -- sudo -n bash -c '
+set -o pipefail
+log=$1; lines=$2
+test -r "$log"
+{
+  i=50
+  while test "$i" -ge 1; do
+    file="$log.$i"
+    test ! -r "$file" || cat -- "$file"
+    i=$((i-1))
+  done
+  cat -- "$log"
+} | tail -n "$lines"
+' bash "$REMOTE_ROOT/server.log" "$lines"
+}
+
 # 使用 root+setsid 启动 Linux Server，并执行一次真实 Client GetInterfaces RPC。
 start_server() {
   info "Starting Linux gRPC Server..."
   STARTED_SERVER=1
   limactl shell "$VM_NAME" -- sudo -n sh -c '
 set -eu
-root=$1; port=$2; src="$root/source"; run="$root/run"
+root=$1; port=$2; max_bytes=$3; backups=$4; history_ttl=$5; history_max=$6
+src="$root/source"; run="$root/run"
 mkdir -p "$run"; cd "$run"
-rm -f "$root/server.pid"; : >"$root/server.log"
+test -r "$src/server/tools/stream_log_rotator.py"
+rm -f "$root/server.pid"; : >"$root/server.log"; : >"$root/server-rotator.err"
 ulimit -l unlimited 2>/dev/null || true
-nohup setsid env WEAKNET_GRPC_ADDRESS="0.0.0.0:$port" \
+# Bash 进程替换让 Server 继续担任 session/PGID leader，同时由同组子进程持有
+# 日志 fd；writer 可以安全关闭、重命名、重开，stop_server 也能按 PGID 一并回收。
+nohup setsid bash -c '\''
+root=$1; port=$2; max_bytes=$3; backups=$4; history_ttl=$5; history_max=$6
+src="$root/source"
+# 即使日志 writer 异常退出，也不能让一次 stdout 写入以 SIGPIPE 抢在 TC 清理前杀死 Server。
+trap "" PIPE
+exec env WEAKNET_GRPC_ADDRESS="0.0.0.0:$port" \
   WEAKNET_BPF_OBJECT="$src/server/build/flow_rate.bpf.o" \
-  "$src/server/bin/weaknet-grpc-server" >"$root/server.log" 2>&1 </dev/null &
+  WEAKNET_TRAFFIC_HISTORY_TTL_SEC="$history_ttl" \
+  WEAKNET_TRAFFIC_HISTORY_MAX_ENTRIES="$history_max" \
+  "$src/server/bin/weaknet-grpc-server" \
+  > >(exec python3 "$src/server/tools/stream_log_rotator.py" \
+      --path "$root/server.log" --max-bytes "$max_bytes" --backups "$backups") 2>&1
+'\'' bash "$root" "$port" "$max_bytes" "$backups" "$history_ttl" "$history_max" \
+  </dev/null >/dev/null 2>"$root/server-rotator.err" &
 pid=$!; tmp="$root/server.pid.tmp.$$"; echo "$pid" >"$tmp"; mv "$tmp" "$root/server.pid"
 sleep .2; kill -0 "$pid"
 pgid=$(ps -o pgid= -p "$pid" | tr -d "[:space:]"); test "$pid" = "$pgid"
-chmod 0644 "$root/server.log" "$root/server.pid"
-' sh "$REMOTE_ROOT" "$GRPC_PORT"
+chmod 0644 "$root/server.log" "$root/server-rotator.err" "$root/server.pid"
+' sh "$REMOTE_ROOT" "$GRPC_PORT" "$SERVER_LOG_MAX_BYTES" "$SERVER_LOG_BACKUPS" \
+  "$TRAFFIC_HISTORY_TTL_SEC" "$TRAFFIC_HISTORY_MAX_ENTRIES"
   local i
   for ((i=0; i<120; i=i+1)); do
     if server_alive && grpc_tcp_ready; then break; fi
     sleep .25
   done
   if ! server_alive || ! grpc_tcp_ready; then
-    limactl shell "$VM_NAME" -- sudo -n tail -n 80 "$REMOTE_ROOT/server.log" >&2 || true
+    limactl shell "$VM_NAME" -- sudo -n sh -c '
+test ! -s "$1/server-rotator.err" || {
+  printf "===== Server log writer =====\n" >&2
+  tail -n 20 "$1/server-rotator.err" >&2
+}
+' sh "$REMOTE_ROOT" || true
+    tail_server_log 80 >&2 || true
     die "Linux Server did not become ready"
   fi
   limactl shell "$VM_NAME" -- bash -c '
@@ -825,7 +915,6 @@ start_all() {
     && { ((!WITH_DASHBOARD)) || { ((dash_up)) && dashboard_http_ready && snapshot_ready; }; }; then
     STARTING=0
     summary
-    ((WITH_DASHBOARD && OPEN_BROWSER)) && open "http://127.0.0.1:$WEB_PORT" >/dev/null 2>&1 || true
     return
   fi
   if ((server_up || dash_up)); then
@@ -847,7 +936,6 @@ start_all() {
   save_ports
   STARTING=0
   summary
-  ((WITH_DASHBOARD && OPEN_BROWSER)) && open "http://127.0.0.1:$WEB_PORT" >/dev/null 2>&1 || true
 }
 
 # 停止脚本拥有的进程但保留 VM。
@@ -907,6 +995,28 @@ show_status() {
   fi
 }
 
+# 显式进入看板；start/restart 只准备后台服务，不再主动打断当前桌面工作流。
+open_dashboard() {
+  host_preflight
+  WEB_PORT="$(saved_port web "$WEB_PORT")"
+  API_PORT="$(saved_port api "$API_PORT")"
+  dashboard_alive \
+    || die "Dashboard is not running. Run ./run-mac.sh start first"
+  dashboard_http_ready \
+    || die "Dashboard is running but its HTTP endpoints are not ready"
+  snapshot_ready \
+    || die "Dashboard is running but the Dashboard-to-gRPC path is not healthy"
+
+  local url="http://127.0.0.1:$WEB_PORT"
+  if ((OPEN_BROWSER)); then
+    command -v open >/dev/null 2>&1 || die "macOS open command is unavailable"
+    open "$url"
+    ok "Opened JaNet Dashboard: $url"
+  else
+    ok "JaNet Dashboard is ready: $url"
+  fi
+}
+
 # 校验日志范围；额外位置参数必须报错，不能被静默忽略。
 log_target() {
   ((${#POSITIONAL[@]} <= 1)) || die "logs accepts at most one target: all/server/dashboard"
@@ -926,7 +1036,7 @@ show_logs() {
   if [[ "$target" == all || "$target" == server ]]; then
     printf '\n===== Linux Server =====\n'
     [[ "$(vm_status)" == Running ]] \
-      && limactl shell "$VM_NAME" -- sudo -n tail -n "$LOG_LINES" "$REMOTE_ROOT/server.log" 2>/dev/null \
+      && tail_server_log "$LOG_LINES" 2>/dev/null \
       || printf 'No Linux Server log.\n'
   fi
 }
@@ -1186,7 +1296,7 @@ run_demo() {
   ((${#POSITIONAL[@]} <= 1)) || die "demo accepts at most one scenario"
   local scenario="${POSITIONAL[0]:-showcase}"
   case "$scenario" in
-    showcase|download|upload|burst|connections|mixed) ;;
+    showcase|download|upload|burst|connections|mixed|tcp-failure) ;;
     *) die "Unsupported demo scenario: $scenario" ;;
   esac
   if [[ -n "$DEMO_DURATION" ]]; then
@@ -1212,7 +1322,7 @@ run_demo() {
 # 解析动作与公共参数；剩余位置参数只交给 logs/test/demo。
 if (($#>0)); then
   case "$1" in
-    setup|start|stop|restart|status|logs|follow|logs-follow|test|demo|intro|help) ACTION=$1; shift ;;
+    setup|start|dashboard|stop|restart|status|logs|follow|logs-follow|test|demo|intro|help) ACTION=$1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) ;;
     *) die "Unknown action: $1" ;;
@@ -1273,6 +1383,7 @@ case "$ACTION" in setup|start|stop|restart|demo) acquire_lock ;; esac
 case "$ACTION" in
   setup) setup_all; ok "macOS/Lima environment is ready" ;;
   start) start_all ;;
+  dashboard) open_dashboard ;;
   stop) stop_all ;;
   restart) inherit_restart_ports; stop_all; start_all ;;
   status) show_status ;;

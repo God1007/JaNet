@@ -4,9 +4,11 @@
 #include "flow_observation_core.hpp"
 #include "net_traffic.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <iostream>
+#include <map>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -269,6 +271,84 @@ int main() {
         CHECK(core::perSecond(demotionDelta.bytes, 1000000000ULL) == 9);
         CHECK(demotionDelta.continuity_lost);
         CHECK(demotionDelta.counter_reset);
+    }
+
+    {
+        // 配置值不能通过 0 或极大数字关闭保护；合法默认值保持不变。
+        const auto defaults = core::normalizeFlowHistoryRetentionPolicy(
+            core::kDefaultFlowHistoryTtlSeconds,
+            core::kDefaultFlowHistoryMaxEntries);
+        CHECK(defaults.ttl.count() ==
+              static_cast<std::int64_t>(core::kDefaultFlowHistoryTtlSeconds));
+        CHECK(defaults.max_entries == core::kDefaultFlowHistoryMaxEntries);
+
+        const auto minimums = core::normalizeFlowHistoryRetentionPolicy(0, 0);
+        CHECK(minimums.ttl.count() ==
+              static_cast<std::int64_t>(core::kMinFlowHistoryTtlSeconds));
+        CHECK(minimums.max_entries == core::kMinFlowHistoryMaxEntries);
+
+        const auto maximums = core::normalizeFlowHistoryRetentionPolicy(
+            std::numeric_limits<std::uint64_t>::max(),
+            std::numeric_limits<std::uint64_t>::max());
+        CHECK(maximums.ttl.count() ==
+              static_cast<std::int64_t>(core::kMaxFlowHistoryTtlSeconds));
+        CHECK(maximums.max_entries == core::kMaxFlowHistoryMaxEntries);
+    }
+
+    {
+        // TTL 使用严格“大于”：刚好位于边界的样本仍保留；本轮活跃 key 即使很旧也受保护。
+        const auto now = std::chrono::system_clock::time_point(std::chrono::seconds(1000));
+        const auto historyAtAge = [&](std::int64_t ageSeconds) {
+            TrafficHistory history;
+            history.lastUpdate = now - std::chrono::seconds(ageSeconds);
+            return history;
+        };
+        std::map<std::string, TrafficHistory> history{
+            {"expired", historyAtAge(301)},
+            {"boundary", historyAtAge(300)},
+            {"fresh", historyAtAge(299)},
+            {"active", historyAtAge(900)},
+        };
+        core::FlowHistoryRetentionPolicy retention;
+        retention.ttl = std::chrono::seconds(300);
+        retention.max_entries = 16;
+        const std::unordered_set<std::string> activeKeys{"active"};
+        const auto result = core::pruneFlowHistory(history, now, retention, activeKeys);
+        CHECK(result.ttl_evictions == 1);
+        CHECK(result.capacity_evictions == 0);
+        CHECK(history.find("expired") == history.end());
+        CHECK(history.find("boundary") != history.end());
+        CHECK(history.find("fresh") != history.end());
+        CHECK(history.find("active") != history.end());
+    }
+
+    {
+        // 超容量时按 lastUpdate 删除最老的非活跃项，最近历史和本轮刚更新项都必须留下。
+        const auto now = std::chrono::system_clock::time_point(std::chrono::seconds(1000));
+        const auto historyAt = [](std::int64_t timestampSeconds) {
+            TrafficHistory history;
+            history.lastUpdate = std::chrono::system_clock::time_point(
+                std::chrono::seconds(timestampSeconds));
+            return history;
+        };
+        std::map<std::string, TrafficHistory> history{
+            {"active-old", historyAt(100)},
+            {"oldest-idle", historyAt(200)},
+            {"middle-idle", historyAt(300)},
+            {"recent-idle", historyAt(400)},
+        };
+        core::FlowHistoryRetentionPolicy retention;
+        retention.ttl = std::chrono::hours(1);
+        retention.max_entries = 3;
+        const std::unordered_set<std::string> activeKeys{"active-old"};
+        const auto result = core::pruneFlowHistory(history, now, retention, activeKeys);
+        CHECK(result.ttl_evictions == 0);
+        CHECK(result.capacity_evictions == 1);
+        CHECK(history.size() == retention.max_entries);
+        CHECK(history.find("active-old") != history.end());
+        CHECK(history.find("oldest-idle") == history.end());
+        CHECK(history.find("middle-idle") != history.end());
+        CHECK(history.find("recent-idle") != history.end());
     }
 
     std::cout << "traffic_core_test: all checks passed\n";

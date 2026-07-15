@@ -56,6 +56,12 @@ class Stage:
     def total_rate(self) -> int:
         return self.connections * self.rate
 
+    @property
+    def is_failure(self) -> bool:
+        """连接失败场景使用独立生成和判定逻辑，不套用字节吞吐门槛。"""
+
+        return self.direction == "tcp-failure"
+
 
 @dataclasses.dataclass(frozen=True)
 class Observation:
@@ -65,10 +71,13 @@ class Observation:
     bps: int
     pps: int
     active_flows: int
+    packets_seen: int
+    lru_insert_attempts: int
     capture_mode: str
     capture_complete: bool
     capture_completeness: str
     map_read_complete: bool
+    map_observability_read_complete: bool
     valid: bool
     baseline_only: bool
     interface: str
@@ -80,6 +89,7 @@ class StageResult:
     """一个阶段的生成侧 JSON 和阶段内 JaNet 样本。"""
 
     stage: Stage
+    baseline: Observation
     generator: dict[str, Any]
     observations: list[Observation]
 
@@ -134,6 +144,10 @@ def scenario_stages(name: str, duration_override: int | None) -> list[Stage]:
         "mixed": Stage(
             "mixed", "上下行混合", "mixed", duration(30), 8, 1 * MIB,
             "4 条下载和 4 条上传同时运行，展示双向聚合。",
+        ),
+        "tcp-failure": Stage(
+            "tcp-failure", "TCP 建连失败", "tcp-failure", duration(30), 6, 0,
+            "连接一个已占用但未监听的临时端口，统计握手失败并关联 TC 包观测。",
         ),
     }
     if name == "showcase":
@@ -432,6 +446,130 @@ raise SystemExit(0 if not errors and len(results) == connections else 1)
 '''
 
 
+# TCP 建连失败生成器：同样经 stdin 执行和 marker/PID 回收，但不发送 HTTP 业务数据。
+GUEST_FAILURE_GENERATOR = r'''
+import atexit
+import collections
+import concurrent.futures
+import json
+import os
+import socket
+import sys
+import time
+
+marker, host, port_raw, _token, _direction, duration_raw, workers_raw, _rate = sys.argv[1:]
+port = int(port_raw)
+duration = float(duration_raw)
+workers = int(workers_raw)
+
+pid_path = f"/tmp/{marker}.pid"
+pid_fd = os.open(pid_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(pid_fd, "w") as pid_file:
+    pid_file.write(str(os.getpid()) + "\n")
+
+def remove_pid_file():
+    try:
+        os.unlink(pid_path)
+    except FileNotFoundError:
+        pass
+
+atexit.register(remove_pid_file)
+scenario_started = time.monotonic()
+scenario_deadline = scenario_started + duration
+
+def worker(_index):
+    counts = collections.Counter()
+    latencies_ms = []
+    while True:
+        remaining = scenario_deadline - time.monotonic()
+        if remaining <= 0.05:
+            break
+        attempt_started = time.monotonic()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(max(0.05, min(1.0, remaining)))
+        try:
+            sock.connect((host, port))
+            counts["unexpected_success"] += 1
+        except TimeoutError:
+            counts["TimeoutError"] += 1
+        except ConnectionRefusedError:
+            counts["ConnectionRefusedError"] += 1
+        except ConnectionResetError:
+            counts["ConnectionResetError"] += 1
+        except OSError as error:
+            counts[f"OSError[{error.errno}]"] += 1
+        finally:
+            sock.close()
+        latencies_ms.append((time.monotonic() - attempt_started) * 1000.0)
+
+        # 若平台立即 RST，限制为每 worker 每 0.5 秒一次，避免短流 key 过快占用 LRU map。
+        delay = 0.5 - (time.monotonic() - attempt_started)
+        if delay > 0:
+            time.sleep(min(delay, max(0.0, scenario_deadline - time.monotonic())))
+    return {"counts": dict(counts), "latencies_ms": latencies_ms}
+
+results = []
+errors = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+    futures = [pool.submit(worker, index) for index in range(workers)]
+    for future in futures:
+        try:
+            results.append(future.result())
+        except Exception as error:
+            errors.append(f"{type(error).__name__}: {error}")
+
+counts = collections.Counter()
+latencies_ms = []
+for result in results:
+    counts.update(result["counts"])
+    latencies_ms.extend(result["latencies_ms"])
+
+unexpected_successes = counts.pop("unexpected_success", 0)
+failed_connections = sum(counts.values())
+attempts_total = failed_connections + unexpected_successes
+other_errors = sum(
+    count for failure_type, count in counts.items() if failure_type.startswith("OSError[")
+)
+latencies_ms.sort()
+
+def percentile(values, fraction):
+    if not values:
+        return 0.0
+    index = min(len(values) - 1, int((len(values) - 1) * fraction))
+    return values[index]
+
+scenario_pass = (
+    not errors
+    and attempts_total > 0
+    and unexpected_successes == 0
+    and failed_connections == attempts_total
+    and other_errors == 0
+)
+output = {
+    "scenario": "tcp-failure",
+    "bytes": 0,
+    "download_bytes": 0,
+    "upload_bytes": 0,
+    "connections_requested": attempts_total,
+    "connections_succeeded": unexpected_successes,
+    "attempts_total": attempts_total,
+    "failed_connections": failed_connections,
+    "unexpected_successes": unexpected_successes,
+    "other_errors": other_errors,
+    "failure_rate_percent": (failed_connections * 100.0 / attempts_total) if attempts_total else 0.0,
+    "failures_by_type": dict(sorted(counts.items())),
+    "latency_p50_ms": percentile(latencies_ms, 0.50),
+    "latency_p95_ms": percentile(latencies_ms, 0.95),
+    "requested_rate_bps": 0,
+    "elapsed_seconds": time.monotonic() - scenario_started,
+    "scenario_pass": scenario_pass,
+    "errors": errors,
+}
+print(json.dumps(output, separators=(",", ":")), flush=True)
+raise SystemExit(0 if scenario_pass else 1)
+'''
+
+
 # 中断或 limactl 传输异常时，通过随机 marker 和 /proc cmdline 双重校验远端 PID。
 GUEST_CLEANUP = r'''
 import os
@@ -503,15 +641,19 @@ def extract_observation(snapshot: dict[str, Any]) -> Observation:
     if active is None:
         raise DemoError("snapshot 中没有活动网络接口")
     traffic = network.get("trafficObservation") or {}
+    map_observability = traffic.get("mapObservability") or {}
     return Observation(
         generation=int(traffic.get("generation") or 0),
         bps=int(active.get("trafficBytesPerSecond") or 0),
         pps=int(active.get("trafficPacketsPerSecond") or 0),
         active_flows=int(active.get("activeFlows") or 0),
+        packets_seen=int(map_observability.get("packetsSeen") or 0),
+        lru_insert_attempts=int(map_observability.get("lruInsertAttempts") or 0),
         capture_mode=str(traffic.get("captureMode") or "unavailable"),
         capture_complete=bool(traffic.get("captureComplete")),
         capture_completeness=str(traffic.get("captureCompleteness") or "unavailable"),
         map_read_complete=bool(traffic.get("mapReadComplete")),
+        map_observability_read_complete=bool(map_observability.get("readComplete")),
         valid=bool(traffic.get("valid")),
         baseline_only=bool(traffic.get("baselineOnly")),
         interface=str(active.get("interfaceName") or active_name),
@@ -536,11 +678,26 @@ class DemoRunner:
         self.marker = f"janet-demo-{secrets.token_hex(12)}"
         self.server = DemoHttpServer(("127.0.0.1", 0), self.token)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.failure_socket: socket.socket | None = None
         self.active_process: subprocess.Popen[str] | None = None
 
     @property
     def server_port(self) -> int:
         return int(self.server.server_address[1])
+
+    def failure_port(self) -> int:
+        """占用一个动态端口但不 listen，使 connect 无法完成且无端口抢占窗口。"""
+
+        if self.failure_socket is None:
+            try:
+                self.failure_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.failure_socket.bind(("127.0.0.1", 0))
+            except OSError as error:
+                if self.failure_socket is not None:
+                    self.failure_socket.close()
+                    self.failure_socket = None
+                raise DemoError(f"无法创建 TCP failure 临时目标: {error}") from error
+        return int(self.failure_socket.getsockname()[1])
 
     def start(self) -> None:
         self.server_thread.start()
@@ -567,6 +724,9 @@ with urllib.request.urlopen(request,timeout=5) as response:
 
     def close(self) -> None:
         self._terminate_active_process()
+        if self.failure_socket is not None:
+            self.failure_socket.close()
+            self.failure_socket = None
         self.server.shutdown()
         self.server.server_close()
         self.server_thread.join(timeout=2)
@@ -607,19 +767,30 @@ with urllib.request.urlopen(request,timeout=5) as response:
 
     def run_stage(self, stage: Stage, index: int, total: int) -> StageResult:
         print(f"\n[{index}/{total}] {stage.title}")
-        print(
-            f"  模拟参数：{stage.direction} · {stage.connections} 条 TCP · "
-            f"{format_rate(stage.rate)}/连接 · {stage.duration}s"
-        )
-        print(f"  预期总速率：{format_rate(stage.total_rate)}")
+        if stage.is_failure:
+            print(
+                f"  模拟参数：{stage.connections} 个 worker · connect timeout 1s · "
+                f"持续 {stage.duration}s"
+            )
+            print("  预期结果：所有 connect 均失败；失败类型由生成器按 errno 精确统计")
+        else:
+            print(
+                f"  模拟参数：{stage.direction} · {stage.connections} 条 TCP · "
+                f"{format_rate(stage.rate)}/连接 · {stage.duration}s"
+            )
+            print(f"  预期总速率：{format_rate(stage.total_rate)}")
 
         # 记录阶段边界；只有之后发布的新 generation 才能归因到本阶段，旧高流量不能导致假 PASS。
         stage_start = extract_observation(fetch_snapshot(self.api_port))
         start_generation = stage_start.generation
 
+        target_port = self.failure_port() if stage.is_failure else self.server_port
+        generator_source = GUEST_FAILURE_GENERATOR if stage.is_failure else GUEST_GENERATOR
+        if stage.is_failure:
+            print(f"  临时目标：{GUEST_HOST}:{target_port}（macOS bind-only socket）")
         command = [
             "limactl", "shell", self.vm, "--", "python3", "-",
-            self.marker, GUEST_HOST, str(self.server_port), self.token, stage.direction,
+            self.marker, GUEST_HOST, str(target_port), self.token, stage.direction,
             str(stage.duration), str(stage.connections), str(stage.rate),
         ]
         stdout_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
@@ -640,7 +811,7 @@ with urllib.request.urlopen(request,timeout=5) as response:
             self.active_process = process
             assert process.stdin is not None
             try:
-                process.stdin.write(GUEST_GENERATOR)
+                process.stdin.write(generator_source)
                 process.stdin.close()
             except (BrokenPipeError, OSError) as error:
                 raise DemoError(f"无法把生成器发送到 Lima: {error}") from error
@@ -661,11 +832,21 @@ with urllib.request.urlopen(request,timeout=5) as response:
                         observation = extract_observation(fetch_snapshot(self.api_port))
                         if observation.generation != last_generation:
                             elapsed = int(now - started)
-                            print(
-                                f"  JaNet +{elapsed:02d}s：{format_rate(observation.bps)} · "
-                                f"{observation.pps} pps · {observation.active_flows} flows · "
-                                f"generation {observation.generation}"
-                            )
+                            if stage.is_failure:
+                                packet_delta = max(
+                                    0, observation.packets_seen - stage_start.packets_seen
+                                )
+                                print(
+                                    f"  JaNet +{elapsed:02d}s：{observation.pps} pps · "
+                                    f"{observation.active_flows} flows · packets +{packet_delta} · "
+                                    f"generation {observation.generation}"
+                                )
+                            else:
+                                print(
+                                    f"  JaNet +{elapsed:02d}s：{format_rate(observation.bps)} · "
+                                    f"{observation.pps} pps · {observation.active_flows} flows · "
+                                    f"generation {observation.generation}"
+                                )
                             last_generation = observation.generation
                         if self._accept_observation(
                             observation, start_generation, accepted_generations
@@ -704,14 +885,21 @@ with urllib.request.urlopen(request,timeout=5) as response:
         except json.JSONDecodeError as error:
             raise DemoError(f"Lima 流量生成器返回了无效 JSON: {error}") from error
         if return_code != 0 or generator.get("errors"):
+            details = generator.get("errors") or {
+                "attempts": generator.get("attempts_total"),
+                "unexpected_successes": generator.get("unexpected_successes"),
+                "other_errors": generator.get("other_errors"),
+                "failures_by_type": generator.get("failures_by_type"),
+            }
             raise DemoError(
-                f"Lima 流量生成器失败: {generator.get('errors') or stderr.strip()}"
+                f"Lima 流量生成器失败: {details or stderr.strip()}"
             )
 
         # 短阶段可能恰好在 generation 边界开始：首个新样本只含极少本轮字节。
         # 若峰值尚未达到可见门槛，就继续等到“阶段结束时所见 generation”的下一代。
         settle_deadline = time.monotonic() + 15
         visibility_threshold = max(64 * 1024, int(stage.total_rate * 0.25))
+        required_packets = max(1, int(generator.get("attempts_total") or 0))
         settle_after_generation = start_generation
         try:
             end_observation = extract_observation(fetch_snapshot(self.api_port))
@@ -724,14 +912,24 @@ with urllib.request.urlopen(request,timeout=5) as response:
             print(f"  [WARN] 结束 snapshot 暂不可用：{error}", file=sys.stderr)
         while True:
             peak = max((item.bps for item in observations), default=0)
+            packet_delta = max(
+                (item.packets_seen - stage_start.packets_seen for item in observations),
+                default=0,
+            )
+            visibility_reached = (
+                packet_delta >= required_packets
+                if stage.is_failure
+                else peak >= visibility_threshold
+            )
             has_post_end_sample = any(
                 item.generation > settle_after_generation for item in observations
             )
-            if (
-                peak >= visibility_threshold
-                or has_post_end_sample
-                or time.monotonic() >= settle_deadline
-            ):
+            settled = (
+                has_post_end_sample and visibility_reached
+                if stage.is_failure
+                else visibility_reached or has_post_end_sample
+            )
+            if settled or time.monotonic() >= settle_deadline:
                 break
             time.sleep(2)
             try:
@@ -743,12 +941,28 @@ with urllib.request.urlopen(request,timeout=5) as response:
             except DemoError as error:
                 print(f"  [WARN] 结束 snapshot 暂不可用：{error}", file=sys.stderr)
         peak = max((item.bps for item in observations), default=0)
-        print(
-            f"  生成结果：{format_bytes(generator['bytes'])} · "
-            f"{generator['connections_succeeded']}/{stage.connections} 连接成功 · "
-            f"JaNet 阶段峰值 {format_rate(peak)}"
+        if stage.is_failure:
+            packet_delta = max(
+                (item.packets_seen - stage_start.packets_seen for item in observations),
+                default=0,
+            )
+            print(
+                f"  生成结果：{generator['failed_connections']}/{generator['attempts_total']} "
+                f"连接失败 · 意外成功 {generator['unexpected_successes']} · "
+                f"JaNet packets +{max(0, packet_delta)}"
+            )
+        else:
+            print(
+                f"  生成结果：{format_bytes(generator['bytes'])} · "
+                f"{generator['connections_succeeded']}/{stage.connections} 连接成功 · "
+                f"JaNet 阶段峰值 {format_rate(peak)}"
+            )
+        return StageResult(
+            stage=stage,
+            baseline=stage_start,
+            generator=generator,
+            observations=observations,
         )
-        return StageResult(stage=stage, generator=generator, observations=observations)
 
     @staticmethod
     def _accept_observation(
@@ -766,6 +980,7 @@ with urllib.request.urlopen(request,timeout=5) as response:
             and observation.capture_mode == "tc"
             and observation.capture_complete
             and observation.map_read_complete
+            and observation.map_observability_read_complete
         )
         if accepted:
             accepted_generations.add(observation.generation)
@@ -790,6 +1005,7 @@ def wait_for_capture(api_port: int, timeout: int = 35) -> Observation:
             last.capture_mode == "tc"
             and last.capture_complete
             and last.map_read_complete
+            and last.map_observability_read_complete
             and last.valid
             and not last.baseline_only
         ):
@@ -809,25 +1025,132 @@ def wait_for_capture(api_port: int, timeout: int = 35) -> Observation:
 def print_plan(stages: list[Stage], vm: str, dashboard_url: str) -> None:
     """执行前明确说明模拟边界、阶段与预计时长。"""
 
-    print("\nJaNet Traffic Demo")
+    failure_demo = any(stage.is_failure for stage in stages)
+    print("\nJaNet TCP Failure Demo" if failure_demo else "\nJaNet Traffic Demo")
     print("=" * 62)
     print("本次模拟做什么：")
-    print(f"  · Lima ({vm}) 作为业务客户端，经 eth0 访问 macOS 临时内存 HTTP 服务。")
-    print("  · 生成入向/出向业务流量；结果验证聚合可见性，tc/full 表示双 TC hook 完整。")
-    print("  · 不修改 qdisc、不创建大文件、不依赖公网下载。")
+    if failure_demo:
+        print(f"  · Lima ({vm}) 并发连接 macOS 上一个已 bind、但故意不 listen 的临时端口。")
+        print("  · 生成器按 Timeout/Refused/Reset/其他 errno 统计真实 connect 结果。")
+        print("  · JaNet 侧只验证同期握手包、PPS、flow 和新 generation，不冒充失败计数。")
+        print("  · 不修改 firewall、路由、qdisc 或 TC；临时 socket 在退出时直接关闭。")
+    else:
+        print(f"  · Lima ({vm}) 作为业务客户端，经 eth0 访问 macOS 临时内存 HTTP 服务。")
+        print("  · 生成入向/出向业务流量；结果验证聚合可见性，tc/full 表示双 TC hook 完整。")
+        print("  · 不修改 qdisc、不创建大文件、不依赖公网下载。")
     print("  · 项目自身已有的 RTT/Ping 探测仍按原配置运行。")
     print("  · 每隔数秒读取 Dashboard snapshot，展示 JaNet 实际观测值。")
     print("\n模拟阶段：")
     for index, stage in enumerate(stages, 1):
-        print(
-            f"  {index}. {stage.title:<10} {stage.duration:>3}s · "
-            f"{stage.connections:>2} flows · {format_rate(stage.total_rate):>12}  {stage.purpose}"
-        )
-    print(f"\n预计耗时：约 {sum(stage.duration for stage in stages)} 秒")
+        if stage.is_failure:
+            print(
+                f"  {index}. {stage.title:<10} {stage.duration:>3}s · "
+                f"{stage.connections:>2} workers · 1s timeout  {stage.purpose}"
+            )
+        else:
+            print(
+                f"  {index}. {stage.title:<10} {stage.duration:>3}s · "
+                f"{stage.connections:>2} flows · {format_rate(stage.total_rate):>12}  {stage.purpose}"
+            )
+    expected_seconds = sum(stage.duration for stage in stages)
+    if failure_demo:
+        print(f"\n预计耗时：约 {expected_seconds} 秒，结束后最多等待 15 秒完成采样归属")
+    else:
+        print(f"\n预计耗时：约 {expected_seconds} 秒")
     print(f"Dashboard：{dashboard_url}")
     print("采样说明：服务端约 10 秒一轮，短于 20 秒的自定义阶段可能错过完整窗口。")
     print("按 Ctrl-C 可随时结束，临时服务和本轮生成器会自动回收。")
     print("=" * 62)
+
+
+def print_failure_summary(result: StageResult) -> bool:
+    """分别验证生成侧连接失败与 JaNet 同期包观测，避免混成一个语义。"""
+
+    generator = result.generator
+    observations = result.observations
+    baseline = result.baseline
+    latest = max(observations, key=lambda item: item.generation, default=baseline)
+    peak_pps = max((item.pps for item in observations), default=0)
+    peak_flows = max((item.active_flows for item in observations), default=0)
+    packets_after = max((item.packets_seen for item in observations), default=baseline.packets_seen)
+    inserts_after = max(
+        (item.lru_insert_attempts for item in observations),
+        default=baseline.lru_insert_attempts,
+    )
+    packets_delta = packets_after - baseline.packets_seen
+    inserts_delta = inserts_after - baseline.lru_insert_attempts
+    attempts = int(generator.get("attempts_total") or 0)
+    failed = int(generator.get("failed_connections") or 0)
+    unexpected_successes = int(generator.get("unexpected_successes") or 0)
+    other_errors = int(generator.get("other_errors") or 0)
+    failure_types = generator.get("failures_by_type") or {}
+    failure_text = ", ".join(
+        f"{failure_type}={count}" for failure_type, count in failure_types.items()
+    ) or "none"
+
+    generator_ok = (
+        attempts > 0
+        and failed == attempts
+        and unexpected_successes == 0
+        and other_errors == 0
+        and bool(generator.get("scenario_pass"))
+    )
+    counters_monotonic = all(
+        item.packets_seen >= baseline.packets_seen
+        and item.lru_insert_attempts >= baseline.lru_insert_attempts
+        for item in observations
+    )
+    interface_stable = all(item.interface == baseline.interface for item in observations)
+    capture_ok = (
+        bool(observations)
+        and latest.capture_mode == "tc"
+        and latest.capture_complete
+        and latest.map_read_complete
+        and latest.map_observability_read_complete
+        and latest.valid
+        and not latest.baseline_only
+        and latest.generation > baseline.generation
+        and counters_monotonic
+        and interface_stable
+    )
+    observed = packets_delta >= attempts and inserts_delta >= attempts
+
+    print("\n模拟结果")
+    print("=" * 62)
+    print(f"TCP 连接尝试：    {attempts}")
+    print(f"连接失败：        {failed}")
+    print(f"意外成功：        {unexpected_successes}")
+    print(f"连接失败率：      {float(generator.get('failure_rate_percent') or 0):.2f}%")
+    print(f"失败类型：        {failure_text}")
+    print(
+        f"失败耗时 P50/P95：{float(generator.get('latency_p50_ms') or 0):.1f}ms / "
+        f"{float(generator.get('latency_p95_ms') or 0):.1f}ms"
+    )
+    print(f"生成阶段总时长：  {float(generator.get('elapsed_seconds') or 0):.1f}s")
+    print("\nJaNet 同期观测：")
+    print(
+        f"  packetsSeen：   {baseline.packets_seen} → {packets_after} "
+        f"(Δ {packets_delta})"
+    )
+    print(
+        f"  LRU inserts：   {baseline.lru_insert_attempts} → {inserts_after} "
+        f"(Δ {inserts_delta})"
+    )
+    print(f"  峰值 PPS/flows：{peak_pps} pps / {peak_flows} flows")
+    print(
+        f"  采集链路：      {latest.capture_mode}/{latest.capture_completeness} · "
+        f"generation {baseline.generation} → {latest.generation} · {latest.interface}"
+    )
+    print("\n口径：失败次数来自 connect()；JaNet 只证明同期完整 TC 采集到了握手流量。")
+    passed = generator_ok and capture_ok and observed
+    if passed:
+        print("[PASS] TCP 建连失败已生成，JaNet 在完成后的新样本中观测到同期包增量。")
+    elif generator_ok:
+        print("[WARN] 建连失败已生成，但 JaNet 新样本或包计数未达到可见性门槛。")
+    else:
+        print("[WARN] 未能生成纯粹、守恒的 TCP 建连失败结果。")
+    print("=" * 62)
+    return passed
 
 
 def print_summary(
@@ -836,6 +1159,11 @@ def print_summary(
     server_metrics: dict[str, int],
 ) -> bool:
     """汇总生成侧与 JaNet 观测侧数据，并返回演示是否达到可见性门槛。"""
+
+    if len(results) == 1 and results[0].stage.is_failure:
+        return print_failure_summary(results[0])
+    if any(result.stage.is_failure for result in results):
+        raise DemoError("tcp-failure 不能与吞吐阶段混合汇总")
 
     observations = [item for result in results for item in result.observations]
     peak = max(observations, key=lambda item: item.bps, default=baseline)
@@ -853,6 +1181,7 @@ def print_summary(
         peak.capture_mode == "tc"
         and peak.capture_complete
         and peak.map_read_complete
+        and peak.map_observability_read_complete
         and peak.valid
         and not peak.baseline_only
         and peak.generation > baseline.generation
@@ -896,7 +1225,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate deterministic JaNet demo traffic")
     parser.add_argument(
         "scenario", nargs="?", default="showcase",
-        choices=("showcase", "download", "upload", "burst", "connections", "mixed"),
+        choices=(
+            "showcase", "download", "upload", "burst", "connections", "mixed",
+            "tcp-failure",
+        ),
     )
     parser.add_argument("--vm", default=os.environ.get("WEAKNET_LIMA_VM", "weaknet-eval"))
     parser.add_argument("--api-port", type=int, default=5174)

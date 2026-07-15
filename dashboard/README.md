@@ -22,18 +22,11 @@ Install and run the dashboard:
 
 ```bash
 cd /path/to/JaNet/dashboard
-npm install
+npm ci
 npm run dev
 ```
 
-When the dashboard API starts, it asks:
-
-```text
-deepseek API key for dashboard AI (press Enter to skip):
-```
-
-Paste the key there for a one-off run. For normal use, put it in `dashboard/.env`
-so restarts keep the key:
+Put the API configuration in `dashboard/.env` so restarts keep it:
 
 ```bash
 DEEPSEEK_API_KEY=sk-your-deepseek-key
@@ -43,9 +36,8 @@ DEEPSEEK_THINKING=disabled
 ```
 
 After editing `.env`, refresh the dashboard page. The dashboard API reloads this
-file when status, snapshots or AI analysis are requested.
-
-You can also avoid the prompt for just one command:
+file when status, snapshots or AI analysis are requested. You can also configure
+one command through environment variables:
 
 ```bash
 DEEPSEEK_API_KEY=sk-... npm run dev
@@ -63,6 +55,9 @@ http://127.0.0.1:5173
 - `DASHBOARD_WEB_PORT`: Vite web port. Default `5173`.
 - `DASHBOARD_API_PORT`: dashboard API port. Default `5174`.
 - `DASHBOARD_PING_TARGETS`: comma-separated default ping targets. Default `127.0.0.1,8.8.8.8,baidu.com`.
+- `DASHBOARD_ANALYZE_MAX_CONCURRENCY`: maximum concurrent `/api/analyze` requests. Default `2`; overflow returns HTTP 429 instead of queuing.
+- `DASHBOARD_WS_MAX_CONNECTIONS`: maximum dashboard WebSocket connections. Default `32`.
+- `DASHBOARD_WS_MAX_BUFFERED_BYTES`: maximum queued outbound bytes per WebSocket before a slow client is disconnected. Default `262144` (256 KiB).
 - `AI_PROVIDER`: optional provider override. Supported: `deepseek`, `dashscope`, `openai`. Default prefers DeepSeek.
 - `DEEPSEEK_API_KEY`: DeepSeek API key for server-side analysis.
 - `DEEPSEEK_BASE_URL`: DeepSeek OpenAI-compatible base URL. Default `https://api.deepseek.com`.
@@ -71,4 +66,18 @@ http://127.0.0.1:5173
 - `DEEPSEEK_REASONING_EFFORT`: `high` or `max` when thinking is enabled. Default `high`.
 - `DASHSCOPE_API_KEY`, `DASHSCOPE_BASE_URL`, `DASHSCOPE_MODEL`: optional DashScope fallback.
 - `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`: optional OpenAI-compatible fallback.
-- `DASHBOARD_AI_PROMPT=0`: skip terminal API key prompt.
+
+## Runtime limits and history semantics
+
+The dashboard is a bounded real-time view, not a historical database.
+
+| Data | In-memory bound | Reset boundary |
+| --- | --- | --- |
+| Live traffic | Latest `72` trusted generations; at the default 10-second polling interval this is about 12 minutes | Browser page reload or close |
+| Events | BFF keeps `300`; snapshot/UI consume the latest `120`; WebSocket hello sends `30` | Dashboard BFF restart |
+| Ping probes | BFF keeps `240` across all targets and snapshot returns the latest `120` | Dashboard BFF restart |
+
+Day- or month-scale history must be exported to a time-series database. Preserve
+timestamps, generation and availability/validity fields, control high-cardinality
+labels, and serve retention-aware minute/hour downsampling. Increasing frontend
+arrays or BFF caches is not a persistence design.

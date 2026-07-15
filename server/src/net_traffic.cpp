@@ -187,6 +187,15 @@ weaknet_grpc::traffic_core::LongFlowPolicy policyFromEnvironment() {
     return policy;
 }
 
+weaknet_grpc::traffic_core::FlowHistoryRetentionPolicy historyRetentionPolicyFromEnvironment() {
+    using namespace weaknet_grpc::traffic_core;
+    return normalizeFlowHistoryRetentionPolicy(
+        parseUnsignedEnv("WEAKNET_TRAFFIC_HISTORY_TTL_SEC",
+                         kDefaultFlowHistoryTtlSeconds),
+        parseUnsignedEnv("WEAKNET_TRAFFIC_HISTORY_MAX_ENTRIES",
+                         kDefaultFlowHistoryMaxEntries));
+}
+
 #if WEAKNET_HAVE_LIBBPF
 uint64_t monotonicNowNs() {
 #if defined(__linux__)
@@ -266,6 +275,10 @@ struct NetTrafficAnalyzer::Impl {
     std::vector<flow_event> pendingKernelEvents;
 
     std::map<std::string, TrafficHistory> trafficHistory;
+    // 只保留异常检测所需的短窗口历史。容量用于抵御短连接 churn，TTL 回收不再活跃的 key。
+    weaknet_grpc::traffic_core::FlowHistoryRetentionPolicy historyRetentionPolicy =
+        historyRetentionPolicyFromEnvironment();
+    std::chrono::steady_clock::time_point lastHistoryTtlSweep{};
     uint64_t burstThresholdBps = 10 * 1024 * 1024;
     uint64_t suspiciousThresholdBps = 50 * 1024 * 1024;
     double burstMultiplier = 3.0;
@@ -1922,10 +1935,19 @@ TrafficSnapshotPtr NetTrafficAnalyzer::refreshSnapshot() {
     }
     if (next->mapReadComplete && !next->baselineOnly) {
         std::lock_guard<std::mutex> historyLock(impl_->historyMutex);
+        std::unordered_set<std::string> updatedHistoryKeys;
+        updatedHistoryKeys.reserve(std::min(next->flows.size(),
+                                            impl_->historyRetentionPolicy.max_entries));
         for (const auto& flow : next->flows) {
             // continuity_lost 是可信度事件，不可进入统计基线，否则下一轮均值会被保守重建值污染。
             if (flow.continuityLost) continue;
             const std::string key = flowHistoryKey(flow);
+            // flows 已按 bps 降序排列；只为最活跃的有界集合维护历史。
+            // 超额流仍保留当前快照和绝对阈值诊断，只是不再制造永久 history key。
+            if (updatedHistoryKeys.size() >= impl_->historyRetentionPolicy.max_entries &&
+                updatedHistoryKeys.find(key) == updatedHistoryKeys.end()) {
+                continue;
+            }
             auto& history = impl_->trafficHistory[key];
             history.bpsHistory.push_back(flow.bps);
             history.ppsHistory.push_back(flow.pps);
@@ -1934,6 +1956,20 @@ TrafficSnapshotPtr NetTrafficAnalyzer::refreshSnapshot() {
             history.lastUpdate = sampleWall;
             while (history.bpsHistory.size() > Impl::kMaxHistorySize) history.bpsHistory.pop_front();
             while (history.ppsHistory.size() > Impl::kMaxHistorySize) history.ppsHistory.pop_front();
+            updatedHistoryKeys.insert(key);
+        }
+
+        // TTL 扫描正常每分钟一次；容量超限时立即执行。裁剪仍在 historyMutex 内，
+        // updatedHistoryKeys 确保本轮刚形成的异常基线不会被最老优先淘汰。
+        constexpr auto kHistoryTtlSweepInterval = std::chrono::minutes(1);
+        const bool ttlSweepDue = impl_->lastHistoryTtlSweep.time_since_epoch().count() == 0 ||
+            sampleSteady - impl_->lastHistoryTtlSweep >= kHistoryTtlSweepInterval;
+        if (ttlSweepDue ||
+            impl_->trafficHistory.size() > impl_->historyRetentionPolicy.max_entries) {
+            weaknet_grpc::traffic_core::pruneFlowHistory(
+                impl_->trafficHistory, sampleWall, impl_->historyRetentionPolicy,
+                updatedHistoryKeys);
+            impl_->lastHistoryTtlSweep = sampleSteady;
         }
         // 在 N 代的 history 临界区内一次固化异常；后续 N+1 或 clearHistory
         // 都不能改变旧 snapshot 的诊断结果。
