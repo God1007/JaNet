@@ -1,7 +1,7 @@
 <p align="center">
   <img
     src="docs/assets/janet-banner.png"
-    alt="JaNet — AI-powered Network Diagnostics; Linux engine, cross-platform Dashboard, gRPC at the core"
+    alt="JaNet — AI-powered Network Diagnostics"
     width="100%"
   />
 </p>
