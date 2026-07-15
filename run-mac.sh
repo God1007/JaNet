@@ -888,7 +888,8 @@ summary() {
   printf '  Logs:      ./run-mac.sh logs        (recent)\n'
   printf '  Live logs: ./run-mac.sh follow      (Ctrl-C to exit)\n'
   printf '  Stop:      ./run-mac.sh stop\n'
-  warn "Metrics are from the Lima VM, not native macOS en0/Wi-Fi"
+  # 这是 macOS/Lima 的预期观测范围，不代表启动异常；使用 INFO 避免成功启动后出现误导性告警。
+  info "Observability scope: metrics come from the Lima VM, not native macOS en0/Wi-Fi"
 }
 
 # 打开 Chrome 的 unpacked extension 管理页；浏览器安全模型不允许脚本替用户静默安装扩展。
