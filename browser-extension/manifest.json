@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "JaNet Browser Failure Collector",
+  "version": "0.1.0",
+  "description": "Reports real Chrome HTTP failures to the local JaNet dashboard without reading request or response content.",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "alarms",
+    "storage",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js",
+    "type": "module"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}

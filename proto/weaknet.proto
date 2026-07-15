@@ -210,6 +210,28 @@ message TrafficObservationStatus {
   bool baseline_only = 30;
 }
 
+// Linux Engine 进程自身的资源快照。CPU 百分比以一个逻辑 CPU 满载为 100%，
+// 因此多线程进程可能超过 100%；累计 CPU 时间和上下文切换计数自进程启动起计算。
+message ProcessResourceSnapshot {
+  int64 sampled_at_unix_ms = 1;
+  // CPU 百分比使用的单调时钟窗口；首轮或窗口过短时 cpu_percent 会列入 unavailable_metrics。
+  uint64 sample_window_ms = 2;
+  double cpu_percent = 3;
+  uint64 user_cpu_time_micros = 4;
+  uint64 system_cpu_time_micros = 5;
+  uint64 rss_bytes = 6;
+  uint64 peak_rss_bytes = 7;
+  uint64 virtual_memory_bytes = 8;
+  uint32 thread_count = 9;
+  uint32 open_fd_count = 10;
+  double uptime_seconds = 11;
+  uint64 voluntary_context_switches = 12;
+  uint64 involuntary_context_switches = 13;
+  uint32 logical_cpu_count = 14;
+  // 无法采集的字段名；调用方必须结合本列表解释数值字段的 proto3 默认零值。
+  repeated string unavailable_metrics = 15;
+}
+
 // 供在线诊断链路使用的唯一结构化网络快照。
 message NetworkSnapshot {
   int64 observed_at_unix_ms = 1;
@@ -224,6 +246,8 @@ message NetworkSnapshot {
   uint64 route_generation = 9;
   int64 route_changed_at_unix_ms = 10;
   string current_default_route_interface = 11;
+  // 生成本快照的 Linux Engine 进程资源，用于量化守护进程自身开销。
+  ProcessResourceSnapshot engine_resources = 12;
 }
 
 // 当前网络质量评估结果。

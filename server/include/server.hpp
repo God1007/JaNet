@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "net_info.hpp"
+#include "process_resource_sampler.hpp"
 
 namespace weaknet_grpc {
 
@@ -23,6 +24,9 @@ class WeakNetMgr;
 struct ServerContext {
     // 工作线程退出开关；跨线程读写，true 表示继续运行。
     std::atomic<bool> running{true};
+
+    // Engine 进程资源差分采样器；与 ServerContext 同寿命，保证 CPU 基线不会随 RPC 重建。
+    ProcessResourceSampler process_resource_sampler;
 
     // 由上下文保存的全部可 join 监控线程；关闭时 requestStop 后逐一回收。
     std::thread iface_thread;

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JaNet Browser Collector</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">JaNet · Browser telemetry</p>
+      <h1>Failure collector</h1>
+      <p class="intro">Only HTTP 4xx/5xx and terminal Chrome network errors are sent to the local dashboard. Bodies, cookies, authorization headers, pathnames, query strings and URL credentials are never collected.</p>
+      <form id="settings-form">
+        <label><span>Enabled</span><input id="enabled" type="checkbox" /></label>
+        <label><span>Local ingest URL</span><input id="ingest-url" type="url" spellcheck="false" required /></label>
+        <label><span>Pairing token</span><input id="token" type="password" autocomplete="off" /></label>
+        <button type="submit">Save settings</button>
+      </form>
+      <p id="status" role="status"></p>
+      <dl><dt>Extension ID</dt><dd id="extension-id"></dd></dl>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

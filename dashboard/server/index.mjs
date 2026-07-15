@@ -1,6 +1,5 @@
 // Dashboard 本地 BFF：把 WeakNet gRPC 查询和事件流转换为 REST/WebSocket，并在服务端编排 AI 诊断。
 
-import cors from "cors";
 import express from "express";
 import grpc from "@grpc/grpc-js";
 import { execFileSync, spawn } from "node:child_process";
@@ -16,6 +15,17 @@ import {
   normalizeDiagnosis
 } from "./diagnosis_contract.mjs";
 import { preferredMetricNumber } from "./metric_compat.mjs";
+import {
+  buildRuntimeResources,
+  normalizeEngineProcessResources
+} from "./process_resource_contract.mjs";
+import { createProcessResourceSampler } from "./process_resource_sampler.mjs";
+import { createRequestFailureMonitor } from "./request_failure_monitor.mjs";
+import {
+  attachSecureWebSocketUpgrade,
+  defaultDashboardOrigins,
+  installApiSecurity
+} from "./origin_security.mjs";
 import {
   admitWebSocketConnection,
   boundedInteger,
@@ -89,6 +99,12 @@ let ragBridgePath = process.env.WEAKNET_RAG_BRIDGE
 
 let grpcAddress = process.env.WEAKNET_GRPC_ADDRESS || "127.0.0.1:50051";
 const apiPort = Number(process.env.DASHBOARD_API_PORT || 5174);
+const webPort = boundedInteger(
+  process.env.DASHBOARD_WEB_PORT,
+  5173,
+  { min: 1, max: 65_535 }
+);
+const dashboardAllowedOrigins = defaultDashboardOrigins(webPort);
 const pingTargets = (process.env.DASHBOARD_PING_TARGETS || "127.0.0.1,8.8.8.8,baidu.com")
   .split(",")
   .map((item) => item.trim())
@@ -108,6 +124,21 @@ const wsMaxBufferedBytes = boundedInteger(
   process.env.DASHBOARD_WS_MAX_BUFFERED_BYTES,
   256 * 1024,
   { min: 16 * 1024, max: 16 * 1024 * 1024 }
+);
+const requestFailureWindowSeconds = boundedInteger(
+  process.env.DASHBOARD_REQUEST_FAILURE_WINDOW_SEC,
+  300,
+  { min: 10, max: 24 * 60 * 60 }
+);
+const requestFailureThreshold = boundedInteger(
+  process.env.DASHBOARD_REQUEST_FAILURE_THRESHOLD,
+  5,
+  { min: 1, max: 10_000 }
+);
+const requestFailureMaxRecent = boundedInteger(
+  process.env.DASHBOARD_REQUEST_FAILURE_MAX_RECENT,
+  500,
+  { min: 10, max: 10_000 }
 );
 
 // 根据显式 provider 或现有 Key 选择 AI 服务及默认模型。
@@ -188,7 +219,8 @@ let client = createWeakNetClient(grpcAddress);
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws/events" });
+// noServer 模式确保 Origin/路径检查发生在 WebSocket 被纳入 clients 集合之前。
+const wss = new WebSocketServer({ noServer: true });
 
 const eventBuffer = [];
 const pingHistory = [];
@@ -203,9 +235,29 @@ let lastGrpcProbeAt = 0;
 let shuttingDown = false;
 const analyzeGate = createConcurrencyGate(analyzeMaxConcurrency);
 const activeRagChildren = new Set();
+// BFF 与 Engine 分开采样：两者属于不同进程，不能用 Node 指标代替 Linux 守护进程开销。
+const dashboardResourceSampler = createProcessResourceSampler();
+// 这里只聚合浏览器扩展旁路上报的真实终态，不主动访问任何业务 URL。
+const requestFailureMonitor = createRequestFailureMonitor({
+  windowMs: requestFailureWindowSeconds * 1000,
+  threshold: requestFailureThreshold,
+  maxRecent: requestFailureMaxRecent
+});
 
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+// 扩展上报与 Dashboard 页面使用不同 Origin 策略；两条链都先鉴权，再解析 JSON/执行采样。
+installApiSecurity(app, {
+  allowedOrigins: dashboardAllowedOrigins,
+  getFailureAuthConfig: () => {
+    loadLocalEnvFiles();
+    return {
+      expectedExtensionId: process.env.DASHBOARD_BROWSER_EXTENSION_ID || "",
+      expectedToken: process.env.DASHBOARD_BROWSER_EXTENSION_TOKEN || ""
+    };
+  },
+  jsonParser: express.json({ limit: "1mb" }),
+  failureIngestHandler: ingestBrowserFailures
+});
+attachSecureWebSocketUpgrade({ server, wss, allowedOrigins: dashboardAllowedOrigins });
 
 // 在 Windows 宿主上探测 WSL 地址，补充跨边界访问 gRPC 的候选目标。
 function detectWslAddress() {
@@ -326,6 +378,7 @@ function normalizeNetworkSnapshot(raw) {
   const quality = raw.quality || {};
   const traffic = raw.trafficObservation || {};
   const map = traffic.mapObservability || {};
+  const engineResources = normalizeEngineProcessResources(raw.engineResources);
 
   return {
     observedAt: toNumber(raw.observedAtUnixMs, now()),
@@ -337,6 +390,7 @@ function normalizeNetworkSnapshot(raw) {
     routeChangedAtUnixMs: toNumber(raw.routeChangedAtUnixMs, 0),
     currentDefaultRouteInterface: raw.currentDefaultRouteInterface || "",
     interfaces,
+    engineResources,
     quality: {
       level: compactProtoEnum(quality.level, "NETWORK_QUALITY_LEVEL_", "UNKNOWN"),
       score: toNumber(quality.score, null),
@@ -790,6 +844,12 @@ async function collectSnapshot() {
 
   const pings = await Promise.all(pingTargets.map((target) => pingTarget(target)));
   const recentEvents = eventBuffer.slice(-120);
+  // 在本轮 RPC/探测完成后采样 BFF，使开销量化覆盖完整的一次 snapshot 编排工作。
+  const runtimeResources = buildRuntimeResources(
+    networkSnapshot?.engineResources ?? null,
+    dashboardResourceSampler.sample()
+  );
+  const requestFailures = requestFailureMonitor.snapshot();
 
   return {
     generatedAt,
@@ -813,6 +873,8 @@ async function collectSnapshot() {
     },
     interfaces,
     networkSnapshot,
+    runtimeResources,
+    requestFailures,
     health,
     pings,
     latencySeries: pingHistory.slice(-120).map((item) => ({
@@ -932,6 +994,7 @@ async function runUnifiedDiagnosis(snapshot, diagnosisConfig = {}) {
 // 返回 BFF、gRPC stream 和 AI 配置的轻量运行状态。
 app.get("/api/status", (_request, response) => {
   refreshAiConfig();
+  const requestFailures = requestFailureMonitor.snapshot();
   response.json({
     ok: true,
     grpcAddress,
@@ -952,9 +1015,30 @@ app.get("/api/status", (_request, response) => {
       connections: wss.clients.size,
       maxConnections: wsMaxConnections,
       maxBufferedBytes: wsMaxBufferedBytes
+    },
+    browserRequestFailures: {
+      connectedRecent: requestFailures.connectedRecent,
+      lastHeartbeatAt: requestFailures.lastHeartbeatAt,
+      lastReceivedAt: requestFailures.lastReceivedAt,
+      totalFailures: requestFailures.totalFailures,
+      activeAlerts: requestFailures.activeAlerts.length,
+      threshold: requestFailures.threshold,
+      windowSeconds: requestFailures.windowSeconds,
+      extensionIdRestricted: Boolean(process.env.DASHBOARD_BROWSER_EXTENSION_ID),
+      tokenRequired: Boolean(process.env.DASHBOARD_BROWSER_EXTENSION_TOKEN)
     }
   });
 });
+
+// Chrome MV3 失败批次到达这里时已经通过独立 Origin/ID/token 守卫并完成有上限的 JSON 解析。
+function ingestBrowserFailures(request, response) {
+  try {
+    const result = requestFailureMonitor.ingest(request.body, { receivedAt: now() });
+    response.status(202).json(result);
+  } catch (error) {
+    response.status(error?.statusCode || 400).json({ error: compactError(error) });
+  }
+}
 
 // 即时采集并返回一次完整 snapshot。
 app.get("/api/snapshot", async (_request, response) => {

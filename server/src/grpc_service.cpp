@@ -199,6 +199,28 @@ int64_t toUnixMillis(const std::chrono::system_clock::time_point& tp) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count();
 }
 
+// 把进程内资源样本复制到协议；unavailable_metrics 保留真实零与采集失败的区别。
+void fillProtoProcessResourceSnapshot(const ProcessResourceSample& sample,
+                                      weaknet::v1::ProcessResourceSnapshot* out) {
+    out->set_sampled_at_unix_ms(sample.sampledAtUnixMs);
+    out->set_sample_window_ms(sample.sampleWindowMs);
+    out->set_cpu_percent(sample.cpuPercent);
+    out->set_user_cpu_time_micros(sample.userCpuTimeMicros);
+    out->set_system_cpu_time_micros(sample.systemCpuTimeMicros);
+    out->set_rss_bytes(sample.rssBytes);
+    out->set_peak_rss_bytes(sample.peakRssBytes);
+    out->set_virtual_memory_bytes(sample.virtualMemoryBytes);
+    out->set_thread_count(sample.threadCount);
+    out->set_open_fd_count(sample.openFdCount);
+    out->set_uptime_seconds(sample.uptimeSeconds);
+    out->set_voluntary_context_switches(sample.voluntaryContextSwitches);
+    out->set_involuntary_context_switches(sample.involuntaryContextSwitches);
+    out->set_logical_cpu_count(sample.logicalCpuCount);
+    for (const auto& metric : sample.unavailableMetrics) {
+        out->add_unavailable_metrics(metric);
+    }
+}
+
 weaknet::v1::TrafficObservationEventType toProtoTrafficObservationEventType(uint32_t type) {
     const int value = static_cast<int>(type);
     if (!weaknet::v1::TrafficObservationEventType_IsValid(value)) {
@@ -295,6 +317,9 @@ public:
 
         const int64_t observedAtUnixMs = toUnixMillis(std::chrono::system_clock::now());
         reply->set_observed_at_unix_ms(observedAtUnixMs);
+        // 资源采样与本轮 typed snapshot 同步返回；采样器内部处理并发 RPC 和极短差分窗口。
+        fillProtoProcessResourceSnapshot(
+            ctx_->process_resource_sampler.sample(), reply->mutable_engine_resources());
 
         const auto trafficAnalyzer = ctx_->weak_mgr ? ctx_->weak_mgr->getTrafficAnalyzer() : nullptr;
         TrafficAnalyzer::ObservationState trafficObservationState;
