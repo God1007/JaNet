@@ -32,7 +32,7 @@ import {
   YAxis
 } from "recharts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+import type { CSSProperties, FormEvent, ReactNode } from "react";
 import type {
   InterfaceSnapshot,
   NetworkEvent,
@@ -88,6 +88,25 @@ const cpuSeriesIds = cpuSeriesOptions.map((option) => option.id);
 const memorySeriesIds = memorySeriesOptions.map((option) => option.id);
 const requestFailureVisibleLimit = 50;
 const requestAlertVisibleLimit = 12;
+const chartTickOneDecimal = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
+const chartTickTwoDecimals = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+
+// 所有趋势图共用一套紧凑 Tooltip 外观，避免 Recharts 默认的 16px 文本压过图表本身。
+const chartTooltipContentStyle = {
+  background: "var(--chart-tooltip-bg)",
+  border: "1px solid var(--chart-tooltip-border)",
+  borderRadius: 6,
+  color: "var(--chart-tooltip-text)",
+  padding: "7px 9px"
+} satisfies CSSProperties;
+const chartTooltipLabelStyle = {
+  color: "var(--chart-tooltip-text)",
+  marginBottom: 4
+} satisfies CSSProperties;
+const chartTooltipItemStyle = {
+  color: "var(--chart-tooltip-text)",
+  padding: "1px 0"
+} satisfies CSSProperties;
 const requestFailureFilters = [
   { id: "all", label: "All" },
   { id: "active", label: "Active alerts" },
@@ -118,6 +137,26 @@ function formatTime(value: number) {
 function formatDateTime(value: number) {
   if (!Number.isFinite(value) || value <= 0) return "n/a";
   return new Date(value).toLocaleString();
+}
+
+// 图轴需要保留低占用 CPU 的差异，但不展示 0.055000% 一类无意义尾数。
+function formatPercentTick(value: unknown) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "n/a";
+  return `${(Math.abs(numeric) < 1 ? chartTickTwoDecimals : chartTickOneDecimal).format(numeric)}%`;
+}
+
+function formatMillisecondsTick(value: unknown) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "n/a";
+  return `${(Math.abs(numeric) < 1 ? chartTickTwoDecimals : chartTickOneDecimal).format(numeric)}ms`;
+}
+
+function formatTrafficTooltip(value: unknown, name: unknown): [string, string] {
+  const label = String(name);
+  if (label === "Throughput B/s") return [formatBytesPerSecond(value), label];
+  if (label === "Packets/s") return [formatPacketsPerSecond(value), label];
+  return [formatCount(value), label];
 }
 
 function formatAge(value: number, now = Date.now()) {
@@ -620,10 +659,10 @@ function App() {
                             </linearGradient>
                           </defs>
                           <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
-                          <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} />
+                          <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" />
                           {showTrafficThroughput && <YAxis yAxisId="bytes" stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={72} tickFormatter={(value) => formatBytesPerSecond(value)} />}
                           {showTrafficCounts && <YAxis yAxisId="count" orientation="right" stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={44} allowDecimals={false} />}
-                          <Tooltip contentStyle={{ background: "var(--chart-tooltip-bg)", border: "1px solid var(--chart-tooltip-border)", borderRadius: 6, color: "var(--chart-tooltip-text)" }} labelStyle={{ color: "var(--chart-tooltip-text)" }} itemStyle={{ color: "var(--chart-tooltip-text)" }} />
+                          <Tooltip formatter={formatTrafficTooltip} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
                           {showTrafficThroughput && <Area yAxisId="bytes" type="monotone" dataKey="bytesPerSecond" stroke="var(--chart-1)" fill="url(#trafficGradient)" strokeWidth={2} name="Throughput B/s" isAnimationActive={false} />}
                           {showTrafficPackets && <Line yAxisId="count" type="monotone" dataKey="packetsPerSecond" stroke="var(--chart-2)" strokeWidth={1.8} dot={false} name="Packets/s" isAnimationActive={false} />}
                           {showTrafficFlows && <Line yAxisId="count" type="monotone" dataKey="activeFlows" stroke="var(--chart-3)" strokeWidth={1.8} dot={false} name="Active flows" isAnimationActive={false} />}
@@ -832,9 +871,9 @@ function App() {
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={resourceHistory} margin={{ top: 10, right: 8, bottom: 0, left: 0 }}>
                         <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
-                        <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} />
-                        <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={52} tickFormatter={(value) => `${value}%`} />
-                        <Tooltip formatter={(value) => formatPercent(value)} contentStyle={{ background: "var(--chart-tooltip-bg)", border: "1px solid var(--chart-tooltip-border)", borderRadius: 6, color: "var(--chart-tooltip-text)" }} labelStyle={{ color: "var(--chart-tooltip-text)" }} itemStyle={{ color: "var(--chart-tooltip-text)" }} />
+                        <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" />
+                        <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={52} tickFormatter={formatPercentTick} />
+                        <Tooltip formatter={(value) => formatPercent(value)} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
                         {showEngineCpu && <Line type="monotone" dataKey="engineCpuPercent" stroke="var(--chart-1)" strokeWidth={2} dot={false} name="Engine CPU" isAnimationActive={false} />}
                         {showDashboardCpu && <Line type="monotone" dataKey="dashboardCpuPercent" stroke="var(--chart-2)" strokeWidth={2} dot={false} name="Dashboard CPU" isAnimationActive={false} />}
                       </LineChart>
@@ -863,9 +902,9 @@ function App() {
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={resourceHistory} margin={{ top: 10, right: 8, bottom: 0, left: 0 }}>
                         <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
-                        <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} />
+                        <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" />
                         <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={70} tickFormatter={(value) => formatResourceBytes(value)} />
-                        <Tooltip formatter={(value) => formatResourceBytes(value)} contentStyle={{ background: "var(--chart-tooltip-bg)", border: "1px solid var(--chart-tooltip-border)", borderRadius: 6, color: "var(--chart-tooltip-text)" }} labelStyle={{ color: "var(--chart-tooltip-text)" }} itemStyle={{ color: "var(--chart-tooltip-text)" }} />
+                        <Tooltip formatter={(value) => formatResourceBytes(value)} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
                         {showEngineMemory && <Line type="monotone" dataKey="engineResidentMemoryBytes" stroke="var(--chart-1)" strokeWidth={2} dot={false} name="Engine RSS" isAnimationActive={false} />}
                         {showDashboardMemory && <Line type="monotone" dataKey="dashboardResidentMemoryBytes" stroke="var(--chart-2)" strokeWidth={2} dot={false} name="Dashboard RSS" isAnimationActive={false} />}
                       </LineChart>
@@ -897,11 +936,11 @@ function App() {
               />
               <div id="probe-rhythm-chart">
                 <ResponsiveContainer width="100%" height={250}>
-                  <LineChart data={probeRhythm.points}>
+                  <LineChart data={probeRhythm.points} margin={{ top: 0, right: 28, bottom: 0, left: 0 }}>
                   <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
-                  <XAxis type="number" dataKey="timestamp" domain={["dataMin", "dataMax"]} tickFormatter={(value) => formatTime(Number(value))} stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} />
-                  <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={52} tickFormatter={(value) => `${value} ms`} />
-                  <Tooltip labelFormatter={(value) => formatDateTime(Number(value))} contentStyle={{ background: "var(--chart-tooltip-bg)", border: "1px solid var(--chart-tooltip-border)", borderRadius: 6, color: "var(--chart-tooltip-text)" }} labelStyle={{ color: "var(--chart-tooltip-text)" }} itemStyle={{ color: "var(--chart-tooltip-text)" }} />
+                  <XAxis type="number" dataKey="timestamp" domain={["dataMin", "dataMax"]} tickFormatter={(value) => formatTime(Number(value))} stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" padding={{ left: 12, right: 12 }} />
+                  <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={52} tickFormatter={formatMillisecondsTick} />
+                  <Tooltip formatter={(value, name) => [formatMilliseconds(value), String(name)]} labelFormatter={(value) => formatDateTime(Number(value))} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
                   {probeRhythm.series.filter((series) => selectedProbeTargets.includes(series.target)).map((series) => (
                     <Line key={series.key} type="monotone" dataKey={series.key} connectNulls stroke={probeColorByTarget.get(series.target) || "var(--chart-5)"} strokeWidth={2} dot={false} name={series.target} isAnimationActive={false} />
                   ))}
@@ -921,12 +960,12 @@ function App() {
                 <div>
                   <h3>Events per minute</h3>
                   <ResponsiveContainer width="100%" height={215}>
-                    <AreaChart data={mergedSnapshot.eventStats.timeline}>
+                    <AreaChart data={mergedSnapshot.eventStats.timeline} margin={{ top: 0, right: 28, bottom: 0, left: 0 }}>
                       <defs><linearGradient id="eventGradient" x1="0" x2="0" y1="0" y2="1"><stop offset="5%" stopColor="var(--chart-2)" stopOpacity={0.3} /><stop offset="95%" stopColor="var(--chart-2)" stopOpacity={0.01} /></linearGradient></defs>
                       <CartesianGrid stroke="var(--chart-grid-soft)" vertical={false} />
-                      <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} />
+                      <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" padding={{ left: 12, right: 12 }} />
                       <YAxis allowDecimals={false} stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={34} />
-                      <Tooltip contentStyle={{ background: "var(--chart-tooltip-bg)", border: "1px solid var(--chart-tooltip-border)", borderRadius: 6, color: "var(--chart-tooltip-text)" }} labelStyle={{ color: "var(--chart-tooltip-text)" }} itemStyle={{ color: "var(--chart-tooltip-text)" }} />
+                      <Tooltip formatter={(value, name) => [formatCount(value), String(name)]} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
                       <Area type="monotone" dataKey="total" stroke="var(--chart-2)" fill="url(#eventGradient)" strokeWidth={2} name="Events" isAnimationActive={false} />
                     </AreaChart>
                   </ResponsiveContainer>

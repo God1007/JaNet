@@ -58,6 +58,9 @@
   --chart-tooltip-bg: #16191f;
   --chart-tooltip-border: #353b45;
   --chart-tooltip-text: #f4f7fa;
+  --chart-axis-font-size: 10px;
+  --chart-tooltip-font-size: 11px;
+  --chart-tooltip-shadow: 0 10px 28px rgba(0, 0, 0, 0.34);
   --chart-1: #8de5c1;
   --chart-2: #65d8e5;
   --chart-3: #f1c21b;
@@ -113,6 +116,7 @@
   --chart-tooltip-bg: #ffffff;
   --chart-tooltip-border: #aeb8c2;
   --chart-tooltip-text: #15191e;
+  --chart-tooltip-shadow: 0 10px 28px rgba(21, 25, 30, 0.14);
   --chart-1: #006b54;
   --chart-2: #006b7d;
   --chart-3: #8e6a00;
@@ -817,6 +821,30 @@ time,
   color: var(--muted);
   font-size: 10px;
   line-height: 1.5;
+}
+
+/* Recharts 默认会继承 16px 正文字号；图轴和悬浮值统一回到高密度监控台的数字层级。 */
+.recharts-cartesian-axis-tick-value {
+  fill: var(--chart-axis);
+  font-family: var(--mono);
+  font-size: var(--chart-axis-font-size);
+  font-variant-numeric: tabular-nums;
+}
+
+.recharts-default-tooltip {
+  max-width: min(280px, calc(100vw - 32px));
+  box-shadow: var(--chart-tooltip-shadow);
+  font-family: var(--mono);
+  font-size: var(--chart-tooltip-font-size);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.recharts-tooltip-label {
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .traffic-facts {
@@ -2178,6 +2206,12 @@ time,
     grid-template-columns: 1fr;
   }
 
+  /* 事件类型与节奏图改为上下排列后，短列表不再保留桌面端的等高空白。 */
+  .event-type-list {
+    height: auto;
+    max-height: 215px;
+  }
+
   .kpi-grid,
   .traffic-facts,
   .capture-summary,
@@ -2229,7 +2263,13 @@ time,
   }
 
   .header-controls {
+    align-items: stretch;
+    flex-direction: column;
     gap: 8px;
+  }
+
+  .header-actions {
+    align-self: flex-start;
   }
 
   .status-pill {
@@ -2255,6 +2295,10 @@ time,
   .traffic-chart-canvas {
     min-height: 280px;
     flex-basis: 280px;
+  }
+
+  .series-options {
+    grid-template-columns: 1fr;
   }
 
   .kpi-grid,
