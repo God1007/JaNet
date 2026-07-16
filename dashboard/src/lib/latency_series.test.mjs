@@ -3,7 +3,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildProbeRhythm } from "./latency_series.mjs";
+import { buildProbeRhythm, mergeProbeHistory } from "./latency_series.mjs";
+import { CHART_WINDOW_MS } from "./chart_window.mjs";
 
 test("isolates multiple targets behind safe data keys and sorts numeric timestamps", () => {
   const rhythm = buildProbeRhythm([
@@ -82,4 +83,24 @@ test("merges targets sampled at the same millisecond and ignores unusable axis r
 test("returns empty collections for missing input", () => {
   assert.deepEqual(buildProbeRhythm(null), { points: [], series: [] });
   assert.deepEqual(buildProbeRhythm([]), { points: [], series: [] });
+});
+
+test("merges browser-local probe history by target and timestamp inside five hours", () => {
+  const now = 10 * CHART_WINDOW_MS;
+  const history = [
+    { timestamp: now - CHART_WINDOW_MS - 1, target: "expired.test", latencyMs: 1, success: true },
+    { timestamp: now - 1000, target: "one.test", latencyMs: 10, success: true }
+  ];
+  const incoming = [
+    { timestamp: now - 1000, target: "one.test", latencyMs: 12, success: true },
+    { timestamp: now - 1000, target: "two.test", latencyMs: 20, success: true },
+    { timestamp: now, target: "one.test", latencyMs: null, success: false }
+  ];
+
+  const merged = mergeProbeHistory(history, incoming, { now });
+
+  assert.equal(merged.length, 3);
+  assert.equal(merged.find((item) => item.target === "one.test" && item.timestamp === now - 1000).latencyMs, 12);
+  assert.ok(merged.some((item) => item.target === "two.test"));
+  assert.ok(!merged.some((item) => item.target === "expired.test"));
 });

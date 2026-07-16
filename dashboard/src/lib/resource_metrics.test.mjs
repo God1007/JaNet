@@ -1,4 +1,4 @@
-// 资源趋势纯函数单测：覆盖合法零值、缺失语义、同刻替换与 72 点上限。
+// 资源趋势纯函数单测：覆盖合法零值、缺失语义、同刻替换与 5 小时双重上限。
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -10,6 +10,7 @@ import {
   formatResourceBytes,
   formatUptime
 } from "./resource_metrics.mjs";
+import { CHART_WINDOW_MS } from "./chart_window.mjs";
 
 function processMetrics(component, overrides = {}) {
   return {
@@ -74,7 +75,7 @@ test("replaces the same timestamp immutably", () => {
   assert.equal(replaced[1].engineCpuPercent, 8);
 });
 
-test("retains at most 72 resource samples by default", () => {
+test("retains at most the five-hour sample limit by default", () => {
   let history = [];
   for (let index = 1; index <= RESOURCE_HISTORY_LIMIT + 5; index += 1) {
     history = appendResourceSample(history, sample(index));
@@ -83,6 +84,17 @@ test("retains at most 72 resource samples by default", () => {
   assert.equal(history.length, RESOURCE_HISTORY_LIMIT);
   assert.equal(history[0].timestamp, 6);
   assert.equal(history.at(-1).timestamp, RESOURCE_HISTORY_LIMIT + 5);
+});
+
+test("drops sparse resource samples older than five hours", () => {
+  const now = 10 * CHART_WINDOW_MS;
+  const history = [
+    sample(now - CHART_WINDOW_MS - 1),
+    sample(now - CHART_WINDOW_MS)
+  ];
+  const result = appendResourceSample(history, sample(now));
+
+  assert.deepEqual(result.map((item) => item.timestamp), [now - CHART_WINDOW_MS, now]);
 });
 
 test("formats memory and uptime while preserving missing values", () => {

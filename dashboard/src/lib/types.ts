@@ -355,6 +355,7 @@ export type RequestFailureSnapshot = {
 };
 
 export type EventTimelinePoint = {
+  timestamp: number;
   time: string;
   total: number;
   [eventType: string]: string | number;

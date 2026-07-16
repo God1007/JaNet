@@ -13,6 +13,7 @@ import {
   formatPacketsPerSecond,
   formatPercent
 } from "./traffic_metrics.mjs";
+import { CHART_WINDOW_MS } from "./chart_window.mjs";
 
 function sample(generation, overrides = {}) {
   return {
@@ -215,6 +216,17 @@ test("keeps a bounded immutable history and replaces the same generation", () =>
 test("clears history when generation moves backwards after a service restart", () => {
   const restarted = appendTrafficSample([sample(41), sample(42)], sample(1));
   assert.deepEqual(restarted.map((item) => item.generation), [1]);
+});
+
+test("drops sparse traffic generations older than five hours", () => {
+  const now = 10 * CHART_WINDOW_MS;
+  const history = [
+    sample(1, { timestamp: now - CHART_WINDOW_MS - 1 }),
+    sample(2, { timestamp: now - CHART_WINDOW_MS })
+  ];
+  const result = appendTrafficSample(history, sample(3, { timestamp: now }));
+
+  assert.deepEqual(result.map((item) => item.generation), [2, 3]);
 });
 
 test("returns null for a reset counter and computes monotonic deltas", () => {
