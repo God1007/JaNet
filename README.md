@@ -2,7 +2,8 @@
   <img
     src="docs/assets/janet-banner.png"
     alt="JaNet — AI-powered Network Diagnostics"
-    width="760"
+    width="520"
+    height="210"
   />
 </p>
 
