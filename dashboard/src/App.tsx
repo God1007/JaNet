@@ -7,6 +7,7 @@ import {
   Database,
   Gauge,
   Globe2,
+  Maximize2,
   Network,
   RefreshCw,
   Router,
@@ -17,7 +18,8 @@ import {
   Moon,
   Sun,
   TerminalSquare,
-  Wifi
+  Wifi,
+  X
 } from "lucide-react";
 import {
   Area,
@@ -35,6 +37,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 import type {
   InterfaceSnapshot,
+  EventTimelinePoint,
   NetworkEvent,
   ProcessResourceMetrics,
   RequestFailureAlert,
@@ -46,6 +49,17 @@ import type {
   TrafficMapObservability,
   TrafficSample
 } from "./lib/types";
+import {
+  CHART_SAMPLE_LIMIT,
+  CHART_WINDOW_LABEL,
+  CHART_WINDOW_MS,
+  trimChartWindow
+} from "./lib/chart_window.mjs";
+import {
+  buildEventStats,
+  EVENT_HISTORY_LIMIT,
+  trimEventTimeline
+} from "./lib/event_stats.mjs";
 import { formatMilliseconds } from "./lib/rtt_format.mjs";
 import {
   appendTrafficSample,
@@ -63,7 +77,11 @@ import {
   formatResourceBytes,
   formatUptime
 } from "./lib/resource_metrics.mjs";
-import { buildProbeRhythm } from "./lib/latency_series.mjs";
+import {
+  PROBE_HISTORY_LIMIT,
+  buildProbeRhythm,
+  mergeProbeHistory
+} from "./lib/latency_series.mjs";
 import {
   reconcileSeriesSelection,
   toggleSeriesSelection
@@ -86,6 +104,11 @@ const memorySeriesOptions = [
 ];
 const cpuSeriesIds = cpuSeriesOptions.map((option) => option.id);
 const memorySeriesIds = memorySeriesOptions.map((option) => option.id);
+const chartRangeOptions = [
+  { label: "30 min", value: 30 * 60 * 1000 },
+  { label: "1 hour", value: 60 * 60 * 1000 },
+  { label: "5 hours", value: CHART_WINDOW_MS }
+] as const;
 const requestFailureVisibleLimit = 50;
 const requestAlertVisibleLimit = 12;
 const chartTickOneDecimal = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
@@ -122,6 +145,21 @@ type RequestFailureFilter = typeof requestFailureFilters[number]["id"];
 const apiBaseUrl = __API_BASE_URL__.replace(/\/$/, "");
 const wsBaseUrl = __WS_BASE_URL__.replace(/\/$/, "");
 type Theme = "light" | "dark";
+type ExpandedChartId = "traffic" | "cpu" | "memory" | "probe" | "events";
+const expandedChartTitles: Record<ExpandedChartId, string> = {
+  traffic: "Live traffic",
+  cpu: "CPU utilization",
+  memory: "Resident memory",
+  probe: "Probe rhythm",
+  events: "Events per minute"
+};
+const expandedChartDescriptions: Record<ExpandedChartId, string> = {
+  traffic: "Compare throughput, packet rate, and active flows on a real numeric time axis.",
+  cpu: "Compare the network engine and Dashboard BFF CPU cost over the selected interval.",
+  memory: "Inspect resident memory growth for both long-running processes.",
+  probe: "Compare successful latency samples by target without converting failures into zero latency.",
+  events: "Inspect continuous minute buckets; empty minutes remain zero instead of disappearing."
+};
 
 // 首屏脚本已经决定初始主题；React 直接复用，避免 hydration 后再闪一次颜色。
 function initialTheme(): Theme {
@@ -248,6 +286,19 @@ function formatWindowSeconds(seconds: number) {
   return `${seconds} sec`;
 }
 
+function formatChartSpan(items: readonly { timestamp: number }[]) {
+  if (items.length < 2) return items.length === 1 ? "single sample" : "no samples";
+  const first = Number(items[0]?.timestamp);
+  const last = Number(items.at(-1)?.timestamp);
+  const spanMs = Math.max(0, last - first);
+  const minutes = Math.floor(spanMs / 60000);
+  if (minutes < 1) return `${Math.max(1, Math.round(spanMs / 1000))} sec span`;
+  if (minutes < 60) return `${minutes} min span`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `${hours}h ${remainder}m span` : `${hours}h span`;
+}
+
 // 管理浏览器到 BFF 的 WebSocket，并把首连历史和实时增量统一交给事件 reducer。
 function useEventStream(onEvent: (event: NetworkEvent) => void) {
   const [connected, setConnected] = useState(false);
@@ -285,6 +336,303 @@ function useEventStream(onEvent: (event: NetworkEvent) => void) {
   return { connected, error };
 }
 
+const chartCursor = {
+  stroke: "var(--accent-border-strong)",
+  strokeWidth: 1,
+  strokeDasharray: "3 3"
+};
+
+function TrafficTrendChart({
+  data,
+  showThroughput,
+  showPackets,
+  showFlows,
+  gradientId,
+  expanded = false
+}: {
+  data: TrafficSample[];
+  showThroughput: boolean;
+  showPackets: boolean;
+  showFlows: boolean;
+  gradientId: string;
+  expanded?: boolean;
+}) {
+  if (!data.length) return <EmptyLine text="Waiting for the first trusted traffic sample." />;
+  const showCounts = showPackets || showFlows;
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <ComposedChart data={data} margin={{ top: 12, right: 8, bottom: 0, left: 0 }} accessibilityLayer>
+        <defs>
+          <linearGradient id={gradientId} x1="0" x2="0" y1="0" y2="1">
+            <stop offset="4%" stopColor="var(--accent)" stopOpacity={0.28} />
+            <stop offset="96%" stopColor="var(--accent)" stopOpacity={0.01} />
+          </linearGradient>
+        </defs>
+        <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
+        <XAxis
+          type="number"
+          dataKey="timestamp"
+          domain={["dataMin", "dataMax"]}
+          tickFormatter={(value) => formatTime(Number(value))}
+          stroke="var(--chart-axis)"
+          tickLine={false}
+          axisLine={false}
+          minTickGap={30}
+          interval="preserveStartEnd"
+        />
+        {showThroughput && <YAxis yAxisId="bytes" stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={72} tickFormatter={(value) => formatBytesPerSecond(value)} />}
+        {showCounts && <YAxis yAxisId="count" orientation="right" stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={44} allowDecimals={false} />}
+        <Tooltip
+          formatter={formatTrafficTooltip}
+          labelFormatter={(value) => formatDateTime(Number(value))}
+          cursor={chartCursor}
+          contentStyle={chartTooltipContentStyle}
+          labelStyle={chartTooltipLabelStyle}
+          itemStyle={chartTooltipItemStyle}
+        />
+        {showThroughput && <Area yAxisId="bytes" type="monotone" dataKey="bytesPerSecond" stroke="var(--chart-1)" fill={`url(#${gradientId})`} strokeWidth={2} activeDot={expanded ? { r: 3 } : false} name="Throughput B/s" isAnimationActive={false} />}
+        {showPackets && <Line yAxisId="count" type="monotone" dataKey="packetsPerSecond" stroke="var(--chart-2)" strokeWidth={1.8} dot={false} activeDot={expanded ? { r: 3 } : false} name="Packets/s" isAnimationActive={false} />}
+        {showFlows && <Line yAxisId="count" type="monotone" dataKey="activeFlows" stroke="var(--chart-3)" strokeWidth={1.8} dot={false} activeDot={expanded ? { r: 3 } : false} name="Active flows" isAnimationActive={false} />}
+      </ComposedChart>
+    </ResponsiveContainer>
+  );
+}
+
+function CpuTrendChart({
+  data,
+  showEngine,
+  showDashboard,
+  expanded = false
+}: {
+  data: ResourceSample[];
+  showEngine: boolean;
+  showDashboard: boolean;
+  expanded?: boolean;
+}) {
+  if (!data.length) return <EmptyLine text="Waiting for the first runtime resource sample." />;
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={data} margin={{ top: 10, right: 8, bottom: 0, left: 0 }} accessibilityLayer>
+        <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
+        <XAxis type="number" dataKey="timestamp" domain={["dataMin", "dataMax"]} tickFormatter={(value) => formatTime(Number(value))} stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" />
+        <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={52} tickFormatter={formatPercentTick} />
+        <Tooltip formatter={(value) => formatPercent(value)} labelFormatter={(value) => formatDateTime(Number(value))} cursor={chartCursor} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
+        {showEngine && <Line type="monotone" dataKey="engineCpuPercent" stroke="var(--chart-1)" strokeWidth={2} dot={false} activeDot={expanded ? { r: 3 } : false} name="Engine CPU" isAnimationActive={false} />}
+        {showDashboard && <Line type="monotone" dataKey="dashboardCpuPercent" stroke="var(--chart-2)" strokeWidth={2} dot={false} activeDot={expanded ? { r: 3 } : false} name="Dashboard CPU" isAnimationActive={false} />}
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+function MemoryTrendChart({
+  data,
+  showEngine,
+  showDashboard,
+  expanded = false
+}: {
+  data: ResourceSample[];
+  showEngine: boolean;
+  showDashboard: boolean;
+  expanded?: boolean;
+}) {
+  if (!data.length) return <EmptyLine text="Waiting for the first runtime resource sample." />;
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={data} margin={{ top: 10, right: 8, bottom: 0, left: 0 }} accessibilityLayer>
+        <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
+        <XAxis type="number" dataKey="timestamp" domain={["dataMin", "dataMax"]} tickFormatter={(value) => formatTime(Number(value))} stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" />
+        <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={70} tickFormatter={(value) => formatResourceBytes(value)} />
+        <Tooltip formatter={(value) => formatResourceBytes(value)} labelFormatter={(value) => formatDateTime(Number(value))} cursor={chartCursor} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
+        {showEngine && <Line type="monotone" dataKey="engineResidentMemoryBytes" stroke="var(--chart-1)" strokeWidth={2} dot={false} activeDot={expanded ? { r: 3 } : false} name="Engine RSS" isAnimationActive={false} />}
+        {showDashboard && <Line type="monotone" dataKey="dashboardResidentMemoryBytes" stroke="var(--chart-2)" strokeWidth={2} dot={false} activeDot={expanded ? { r: 3 } : false} name="Dashboard RSS" isAnimationActive={false} />}
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+type ProbeRhythm = ReturnType<typeof buildProbeRhythm>;
+
+function ProbeTrendChart({
+  rhythm,
+  selectedTargets,
+  colorByTarget,
+  expanded = false
+}: {
+  rhythm: ProbeRhythm;
+  selectedTargets: readonly string[];
+  colorByTarget: ReadonlyMap<string, string>;
+  expanded?: boolean;
+}) {
+  if (!rhythm.points.length) return <EmptyLine text="Waiting for successful latency samples." />;
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={rhythm.points} margin={{ top: 0, right: 28, bottom: 0, left: 0 }} accessibilityLayer>
+        <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
+        <XAxis type="number" dataKey="timestamp" domain={["dataMin", "dataMax"]} tickFormatter={(value) => formatTime(Number(value))} stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" padding={{ left: 12, right: 12 }} />
+        <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={52} tickFormatter={formatMillisecondsTick} />
+        <Tooltip formatter={(value, name) => [formatMilliseconds(value), String(name)]} labelFormatter={(value) => formatDateTime(Number(value))} cursor={chartCursor} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
+        {rhythm.series.filter((series) => selectedTargets.includes(series.target)).map((series) => (
+          <Line key={series.key} type="monotone" dataKey={series.key} connectNulls stroke={colorByTarget.get(series.target) || "var(--chart-5)"} strokeWidth={2} dot={false} activeDot={expanded ? { r: 3 } : false} name={series.target} isAnimationActive={false} />
+        ))}
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+function EventCadenceChart({
+  data,
+  gradientId,
+  expanded = false
+}: {
+  data: EventTimelinePoint[];
+  gradientId: string;
+  expanded?: boolean;
+}) {
+  if (!data.length) return <EmptyLine text="Waiting for the first event signal." />;
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <AreaChart data={data} margin={{ top: 0, right: 28, bottom: 0, left: 0 }} accessibilityLayer>
+        <defs>
+          <linearGradient id={gradientId} x1="0" x2="0" y1="0" y2="1">
+            <stop offset="5%" stopColor="var(--chart-2)" stopOpacity={0.3} />
+            <stop offset="95%" stopColor="var(--chart-2)" stopOpacity={0.01} />
+          </linearGradient>
+        </defs>
+        <CartesianGrid stroke="var(--chart-grid-soft)" vertical={false} />
+        <XAxis type="number" dataKey="timestamp" domain={["dataMin", "dataMax"]} tickFormatter={(value) => formatTime(Number(value))} stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" padding={{ left: 12, right: 12 }} />
+        <YAxis allowDecimals={false} stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={34} />
+        <Tooltip formatter={(value, name) => [formatCount(value), String(name)]} labelFormatter={(value) => formatDateTime(Number(value))} cursor={chartCursor} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
+        <Area type="monotone" dataKey="total" stroke="var(--chart-2)" fill={`url(#${gradientId})`} strokeWidth={2} activeDot={expanded ? { r: 3 } : false} name="Events" isAnimationActive={false} />
+      </AreaChart>
+    </ResponsiveContainer>
+  );
+}
+
+function ChartExpandButton({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button className="chart-expand-button" type="button" aria-haspopup="dialog" onClick={onClick}>
+      <Maximize2 size={13} aria-hidden="true" />
+      <span>Expand</span>
+      <span className="sr-only"> {label}</span>
+    </button>
+  );
+}
+
+// Native dialog 会让背景失去交互，但 Recharts 的可访问图层位于最后一个 Tab 位时，
+// 部分浏览器仍可能短暂把焦点落到 body；显式收口 Tab 顺序，保证键盘分析不中断。
+function dialogFocusableElements(dialog: HTMLDialogElement) {
+  return Array.from(
+    dialog.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'
+    )
+  ).filter((element) => element.getClientRects().length > 0 && element.getAttribute("aria-hidden") !== "true");
+}
+
+function ChartAnalysisDialog({
+  title,
+  description,
+  sampleCount,
+  span,
+  rangeMs,
+  onRangeChange,
+  onClose,
+  children
+}: {
+  title: string;
+  description: string;
+  sampleCount: number;
+  span: string;
+  rangeMs: number;
+  onRangeChange: (value: number) => void;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const [chartReady, setChartReady] = useState(false);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    dialog.showModal();
+    // ResponsiveContainer 只能在 dialog 获得真实布局尺寸后挂载，否则会产生 0x0 测量警告。
+    setChartReady(true);
+    closeButtonRef.current?.focus();
+    return () => {
+      if (dialog.open) dialog.close();
+      document.body.style.overflow = previousOverflow;
+      previousFocusRef.current?.focus();
+    };
+  }, []);
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="chart-analysis-dialog"
+      aria-labelledby="chart-analysis-title"
+      aria-describedby="chart-analysis-description"
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+      onKeyDown={(event) => {
+        if (event.key !== "Tab") return;
+        const focusable = dialogFocusableElements(event.currentTarget);
+        if (!focusable.length) {
+          event.preventDefault();
+          closeButtonRef.current?.focus();
+          return;
+        }
+
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const active = document.activeElement;
+        if (event.shiftKey && (active === first || !event.currentTarget.contains(active))) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (active === last || !event.currentTarget.contains(active))) {
+          event.preventDefault();
+          first.focus();
+        }
+      }}
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section className="chart-analysis-shell">
+        <header className="chart-analysis-header">
+          <div>
+            <span className="quiet-label">Trend analysis</span>
+            <h2 id="chart-analysis-title">{title}</h2>
+            <p id="chart-analysis-description">{description}</p>
+          </div>
+          <button ref={closeButtonRef} className="chart-dialog-close" type="button" onClick={onClose} aria-label={`Close expanded ${title} chart`}>
+            <X size={18} aria-hidden="true" />
+          </button>
+        </header>
+        <div className="chart-analysis-toolbar">
+          <div className="chart-range-picker" role="group" aria-label="Analysis time range">
+            {chartRangeOptions.map((option) => (
+              <button key={option.value} type="button" aria-pressed={rangeMs === option.value} onClick={() => onRangeChange(option.value)}>
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <p><strong>{sampleCount}</strong> plotted points <span>|</span> {span} <span>|</span> browser-local</p>
+        </div>
+        <div className="chart-analysis-content">
+          {chartReady ? children : <EmptyLine text="Preparing expanded chart." />}
+        </div>
+        <footer>Hover or focus the plot to inspect exact values. Narrow the time range and visible series to isolate an anomaly.</footer>
+      </section>
+    </dialog>
+  );
+}
+
 // REST snapshot、WebSocket 增量与前端环形历史共同驱动整个实时看板。
 function App() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
@@ -292,6 +640,7 @@ function App() {
   const [events, setEvents] = useState<NetworkEvent[]>([]);
   const [trafficHistory, setTrafficHistory] = useState<TrafficSample[]>([]);
   const [resourceHistory, setResourceHistory] = useState<ResourceSample[]>([]);
+  const [probeHistory, setProbeHistory] = useState<Snapshot["latencySeries"]>([]);
   const [selectedTrafficSeries, setSelectedTrafficSeries] = useState<string[]>(["bytesPerSecond"]);
   const [selectedCpuSeries, setSelectedCpuSeries] = useState<string[]>(cpuSeriesIds);
   const [selectedMemorySeries, setSelectedMemorySeries] = useState<string[]>(memorySeriesIds);
@@ -306,6 +655,9 @@ function App() {
   const [pingHost, setPingHost] = useState("8.8.8.8");
   const [pingLoading, setPingLoading] = useState(false);
   const [pingError, setPingError] = useState("");
+  const [expandedChart, setExpandedChart] = useState<ExpandedChartId | null>(null);
+  const [expandedRangeMs, setExpandedRangeMs] = useState<number>(CHART_WINDOW_MS);
+  const [chartNow, setChartNow] = useState(() => Date.now());
   const requestInFlight = useRef(false);
 
   // 用户选择持久化到浏览器，并同步原生控件和浏览器顶部主题色。
@@ -323,11 +675,20 @@ function App() {
     }
   }, [theme]);
 
-  // 按事件 id 去重，只保留最近 120 条，避免长时间展示导致内存无界增长。
+  // 即使采集停住也每分钟推进可见窗口，确保超过 5 小时的旧线不会永久留在屏幕上。
+  useEffect(() => {
+    const timer = window.setInterval(() => setChartNow(Date.now()), 60 * 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  // 按事件 id 去重；类型构成和分钟趋势共享同一份 5 小时、300 条上限的证据集。
   const onEvent = useCallback((event: NetworkEvent) => {
     setEvents((current) => {
       if (current.some((item) => item.id === event.id)) return current;
-      return [...current, event].sort((left, right) => left.timestamp - right.timestamp).slice(-120);
+      return trimChartWindow(
+        [...current, event].sort((left, right) => left.timestamp - right.timestamp),
+        { now: Date.now(), maxPoints: EVENT_HISTORY_LIMIT }
+      );
     });
   }, []);
 
@@ -345,20 +706,26 @@ function App() {
       const next = (await response.json()) as Snapshot;
       setSnapshot(next);
       setLastUpdatedAt(Date.now());
+      setChartNow(Date.now());
       const trafficSample = createTrafficSample(next.networkSnapshot);
       if (trafficSample) {
-        setTrafficHistory((current) => appendTrafficSample(current, trafficSample, 72));
+        setTrafficHistory((current) => appendTrafficSample(current, trafficSample));
       }
       const resourceSample = createResourceSample(next.runtimeResources);
       if (resourceSample) {
-        setResourceHistory((current) => appendResourceSample(current, resourceSample, 72));
+        setResourceHistory((current) => appendResourceSample(current, resourceSample));
       }
+      setProbeHistory((current) => mergeProbeHistory(current, next.latencySeries, {
+        now: next.generatedAt,
+        maxPoints: PROBE_HISTORY_LIMIT
+      }));
       setEvents((current) => {
         const merged = [...current, ...next.events];
         const unique = new Map(merged.map((event) => [event.id, event]));
-        return Array.from(unique.values())
-          .sort((left, right) => left.timestamp - right.timestamp)
-          .slice(-120);
+        return trimChartWindow(
+          Array.from(unique.values()).sort((left, right) => left.timestamp - right.timestamp),
+          { now: next.generatedAt, maxPoints: EVENT_HISTORY_LIMIT }
+        );
       });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -376,30 +743,80 @@ function App() {
     return () => window.clearInterval(timer);
   }, [loadSnapshot]);
 
-  // WebSocket 事件覆盖 snapshot 的旧事件集合，图表聚合始终基于同一份去重数据。
+  // WebSocket 增量与 snapshot 种子在浏览器合并后统一聚合，避免类型构成和趋势口径分裂。
   const mergedSnapshot = useMemo(() => {
     if (!snapshot) return null;
     return {
       ...snapshot,
       events,
-      eventStats: {
-        ...snapshot.eventStats,
-        byType: Object.entries(
-          events.reduce<Record<string, number>>((acc, event) => {
-            acc[event.type] = (acc[event.type] || 0) + 1;
-            return acc;
-          }, {})
-        )
-          .map(([name, value]) => ({ name, value }))
-          .sort((a, b) => b.value - a.value)
-      }
+      eventStats: buildEventStats(events, { now: chartNow, maxEvents: EVENT_HISTORY_LIMIT })
     };
-  }, [events, snapshot]);
+  }, [chartNow, events, snapshot]);
+
+  const visibleTrafficHistory = useMemo(
+    () => trimChartWindow(trafficHistory, { now: chartNow, maxPoints: CHART_SAMPLE_LIMIT }),
+    [chartNow, trafficHistory]
+  );
+  const visibleResourceHistory = useMemo(
+    () => trimChartWindow(resourceHistory, { now: chartNow, maxPoints: CHART_SAMPLE_LIMIT }),
+    [chartNow, resourceHistory]
+  );
+  const visibleProbeHistory = useMemo(
+    () => trimChartWindow(probeHistory, { now: chartNow, maxPoints: PROBE_HISTORY_LIMIT }),
+    [chartNow, probeHistory]
+  );
+  const visibleEventTimeline = useMemo(
+    () => mergedSnapshot?.eventStats.timeline ?? [],
+    [mergedSnapshot?.eventStats.timeline]
+  );
+
+  const expandedTrafficHistory = useMemo(
+    () => {
+      if (expandedChart !== "traffic") return [];
+      if (expandedRangeMs === CHART_WINDOW_MS) return visibleTrafficHistory;
+      return trimChartWindow(visibleTrafficHistory, { now: chartNow, windowMs: expandedRangeMs, maxPoints: CHART_SAMPLE_LIMIT });
+    },
+    [chartNow, expandedChart, expandedRangeMs, visibleTrafficHistory]
+  );
+  const expandedResourceHistory = useMemo(
+    () => {
+      if (expandedChart !== "cpu" && expandedChart !== "memory") return [];
+      if (expandedRangeMs === CHART_WINDOW_MS) return visibleResourceHistory;
+      return trimChartWindow(visibleResourceHistory, { now: chartNow, windowMs: expandedRangeMs, maxPoints: CHART_SAMPLE_LIMIT });
+    },
+    [chartNow, expandedChart, expandedRangeMs, visibleResourceHistory]
+  );
+  const expandedProbeHistory = useMemo(
+    () => {
+      if (expandedChart !== "probe") return [];
+      if (expandedRangeMs === CHART_WINDOW_MS) return visibleProbeHistory;
+      return trimChartWindow(visibleProbeHistory, { now: chartNow, windowMs: expandedRangeMs, maxPoints: PROBE_HISTORY_LIMIT });
+    },
+    [chartNow, expandedChart, expandedRangeMs, visibleProbeHistory]
+  );
+  const expandedEventTimeline = useMemo(
+    () => {
+      if (expandedChart !== "events") return [];
+      if (expandedRangeMs === CHART_WINDOW_MS) return visibleEventTimeline;
+      return trimEventTimeline(visibleEventTimeline, {
+        now: chartNow,
+        windowMs: expandedRangeMs,
+        maxPoints: Math.ceil(CHART_WINDOW_MS / 60000) + 1
+      });
+    },
+    [chartNow, expandedChart, expandedRangeMs, visibleEventTimeline]
+  );
 
   // 每个 target 使用独立 dataKey；失败值保持 null，但不再切断其他 target 的曲线。
   const probeRhythm = useMemo(
-    () => buildProbeRhythm(mergedSnapshot?.latencySeries ?? []),
-    [mergedSnapshot?.latencySeries]
+    () => buildProbeRhythm(visibleProbeHistory),
+    [visibleProbeHistory]
+  );
+  const expandedProbeRhythm = useMemo(
+    () => expandedChart === "probe"
+      ? buildProbeRhythm(expandedProbeHistory)
+      : { points: [], series: [] },
+    [expandedChart, expandedProbeHistory]
   );
   // Probe 的 probe_N 会随数据窗口重建；选择状态必须绑定稳定 target，而不是动态图表 key。
   const availableProbeTargets = useMemo(
@@ -443,6 +860,11 @@ function App() {
 
   function toggleMemorySeries(seriesId: string) {
     setSelectedMemorySeries((current) => toggleSeriesSelection(current, seriesId, memorySeriesIds));
+  }
+
+  function openExpandedChart(chart: ExpandedChartId) {
+    setExpandedRangeMs(CHART_WINDOW_MS);
+    setExpandedChart(chart);
   }
 
   async function runAnalysis() {
@@ -506,19 +928,27 @@ function App() {
   );
   const score = quality?.score ?? mergedSnapshot?.health.score ?? null;
   const scoreOffset = 326 - ((score ?? 0) / 100) * 326;
-  const previousTrafficSample = trafficHistory.length > 1 ? trafficHistory.at(-2) ?? null : null;
-  const latestTrafficSample = trafficHistory.at(-1) ?? null;
+  const previousTrafficSample = visibleTrafficHistory.length > 1 ? visibleTrafficHistory.at(-2) ?? null : null;
+  const latestTrafficSample = visibleTrafficHistory.at(-1) ?? null;
   const packetDelta = latestTrafficSample && previousTrafficSample
     ? counterDelta(latestTrafficSample.packetsSeen, previousTrafficSample.packetsSeen)
     : null;
   const showTrafficThroughput = selectedTrafficSeries.includes("bytesPerSecond");
   const showTrafficPackets = selectedTrafficSeries.includes("packetsPerSecond");
   const showTrafficFlows = selectedTrafficSeries.includes("activeFlows");
-  const showTrafficCounts = showTrafficPackets || showTrafficFlows;
   const showEngineCpu = selectedCpuSeries.includes("engineCpuPercent");
   const showDashboardCpu = selectedCpuSeries.includes("dashboardCpuPercent");
   const showEngineMemory = selectedMemorySeries.includes("engineResidentMemoryBytes");
   const showDashboardMemory = selectedMemorySeries.includes("dashboardResidentMemoryBytes");
+  const expandedChartPoints: readonly { timestamp: number }[] = expandedChart === "traffic"
+    ? expandedTrafficHistory
+    : expandedChart === "cpu" || expandedChart === "memory"
+      ? expandedResourceHistory
+      : expandedChart === "probe"
+        ? expandedProbeRhythm.points
+        : expandedChart === "events"
+          ? expandedEventTimeline
+          : [];
 
   return (
     <main className="app-shell">
@@ -637,7 +1067,7 @@ function App() {
                   eyebrow="Traffic pulse"
                   title="Live traffic since this page opened"
                   icon={<Activity size={20} />}
-                  meta={`${trafficHistory.length} trusted generations retained`}
+                  meta={`${visibleTrafficHistory.length} trusted generations | ${CHART_WINDOW_LABEL}`}
                 />
                 <div className="traffic-layout">
                   <div className="chart-region">
@@ -647,29 +1077,19 @@ function App() {
                       selectedIds={selectedTrafficSeries}
                       controls="traffic-chart"
                       onToggle={toggleTrafficSeries}
+                      action={<ChartExpandButton label="live traffic" onClick={() => openExpandedChart("traffic")} />}
                     />
                     {/* 桌面双栏时随右侧事实列表拉伸，充分利用该网格行原本空出的纵向空间。 */}
                     <div className="traffic-chart-canvas" id="traffic-chart">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <ComposedChart data={trafficHistory} margin={{ top: 12, right: 8, bottom: 0, left: 0 }}>
-                          <defs>
-                            <linearGradient id="trafficGradient" x1="0" x2="0" y1="0" y2="1">
-                              <stop offset="4%" stopColor="var(--accent)" stopOpacity={0.28} />
-                              <stop offset="96%" stopColor="var(--accent)" stopOpacity={0.01} />
-                            </linearGradient>
-                          </defs>
-                          <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
-                          <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" />
-                          {showTrafficThroughput && <YAxis yAxisId="bytes" stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={72} tickFormatter={(value) => formatBytesPerSecond(value)} />}
-                          {showTrafficCounts && <YAxis yAxisId="count" orientation="right" stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={44} allowDecimals={false} />}
-                          <Tooltip formatter={formatTrafficTooltip} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
-                          {showTrafficThroughput && <Area yAxisId="bytes" type="monotone" dataKey="bytesPerSecond" stroke="var(--chart-1)" fill="url(#trafficGradient)" strokeWidth={2} name="Throughput B/s" isAnimationActive={false} />}
-                          {showTrafficPackets && <Line yAxisId="count" type="monotone" dataKey="packetsPerSecond" stroke="var(--chart-2)" strokeWidth={1.8} dot={false} name="Packets/s" isAnimationActive={false} />}
-                          {showTrafficFlows && <Line yAxisId="count" type="monotone" dataKey="activeFlows" stroke="var(--chart-3)" strokeWidth={1.8} dot={false} name="Active flows" isAnimationActive={false} />}
-                        </ComposedChart>
-                      </ResponsiveContainer>
+                      <TrafficTrendChart
+                        data={visibleTrafficHistory}
+                        showThroughput={showTrafficThroughput}
+                        showPackets={showTrafficPackets}
+                        showFlows={showTrafficFlows}
+                        gradientId="traffic-gradient-inline"
+                      />
                     </div>
-                    <p className="chart-note">Browser-local history. Repeated generations replace the last point; a server restart starts a new series.</p>
+                    <p className="chart-note">Up to 5 hours of browser-local history. Repeated generations replace the last point; a server restart starts a new series.</p>
                   </div>
                   <aside className="traffic-facts" aria-label="Latest traffic sample">
                     <DataFact label="Current throughput" value={activeInterface && trafficTrusted ? availableMetric(activeInterface.trafficAvailability, activeInterface.trafficBytesPerSecond, formatBytesPerSecond) : "n/a"} />
@@ -816,7 +1236,7 @@ function App() {
               eyebrow="Runtime footprint"
               title="Resource and scheduler statistics"
               icon={<Cpu size={20} />}
-              meta={`${resourceHistory.length} browser-local samples · ${runtimeResources ? `sampled ${formatAge(runtimeResources.sampledAt)}` : "runtime sampler unavailable"}`}
+              meta={`${visibleResourceHistory.length} browser-local samples | ${runtimeResources ? `sampled ${formatAge(runtimeResources.sampledAt)}` : "runtime sampler unavailable"}`}
             />
             <div className="resource-semantics">
               <strong>CPU scale</strong>
@@ -841,8 +1261,8 @@ function App() {
               />
               <DataFact
                 label="History retention"
-                value={`${formatCount(resourceHistory.length)} / 72`}
-                meta="Current page session only"
+                value={`${formatCount(visibleResourceHistory.length)} / ${formatCount(CHART_SAMPLE_LIMIT)}`}
+                meta="5h TTL | current page session"
               />
             </div>
 
@@ -865,22 +1285,12 @@ function App() {
                   selectedIds={selectedCpuSeries}
                   controls="resource-cpu-chart"
                   onToggle={toggleCpuSeries}
+                  action={<ChartExpandButton label="CPU utilization" onClick={() => openExpandedChart("cpu")} />}
                 />
                 <div className="resource-chart-canvas" id="resource-cpu-chart">
-                  {resourceHistory.length ? (
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={resourceHistory} margin={{ top: 10, right: 8, bottom: 0, left: 0 }}>
-                        <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
-                        <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" />
-                        <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={52} tickFormatter={formatPercentTick} />
-                        <Tooltip formatter={(value) => formatPercent(value)} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
-                        {showEngineCpu && <Line type="monotone" dataKey="engineCpuPercent" stroke="var(--chart-1)" strokeWidth={2} dot={false} name="Engine CPU" isAnimationActive={false} />}
-                        {showDashboardCpu && <Line type="monotone" dataKey="dashboardCpuPercent" stroke="var(--chart-2)" strokeWidth={2} dot={false} name="Dashboard CPU" isAnimationActive={false} />}
-                      </LineChart>
-                    </ResponsiveContainer>
-                  ) : <EmptyLine text="Waiting for the first runtime resource sample." />}
+                  <CpuTrendChart data={visibleResourceHistory} showEngine={showEngineCpu} showDashboard={showDashboardCpu} />
                 </div>
-                <p className="chart-note">Instantaneous process CPU over each sampler window; missing samples remain gaps.</p>
+                <p className="chart-note">Up to 5 hours of instantaneous process CPU; missing samples remain gaps.</p>
               </article>
 
               <article className="resource-chart-card">
@@ -896,22 +1306,12 @@ function App() {
                   selectedIds={selectedMemorySeries}
                   controls="resource-memory-chart"
                   onToggle={toggleMemorySeries}
+                  action={<ChartExpandButton label="resident memory" onClick={() => openExpandedChart("memory")} />}
                 />
                 <div className="resource-chart-canvas" id="resource-memory-chart">
-                  {resourceHistory.length ? (
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={resourceHistory} margin={{ top: 10, right: 8, bottom: 0, left: 0 }}>
-                        <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
-                        <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" />
-                        <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={70} tickFormatter={(value) => formatResourceBytes(value)} />
-                        <Tooltip formatter={(value) => formatResourceBytes(value)} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
-                        {showEngineMemory && <Line type="monotone" dataKey="engineResidentMemoryBytes" stroke="var(--chart-1)" strokeWidth={2} dot={false} name="Engine RSS" isAnimationActive={false} />}
-                        {showDashboardMemory && <Line type="monotone" dataKey="dashboardResidentMemoryBytes" stroke="var(--chart-2)" strokeWidth={2} dot={false} name="Dashboard RSS" isAnimationActive={false} />}
-                      </LineChart>
-                    </ResponsiveContainer>
-                  ) : <EmptyLine text="Waiting for the first runtime resource sample." />}
+                  <MemoryTrendChart data={visibleResourceHistory} showEngine={showEngineMemory} showDashboard={showDashboardMemory} />
                 </div>
-                <p className="chart-note">RSS is current resident memory, not cumulative allocation or virtual address space.</p>
+                <p className="chart-note">Up to 5 hours of current RSS, not cumulative allocation or virtual address space.</p>
               </article>
             </div>
           </section>
@@ -920,7 +1320,7 @@ function App() {
 
           <section className="evidence-grid" id="diagnostic-evidence">
             <article className="panel chart-panel">
-              <PanelHeading eyebrow="Latency trace" title="Probe rhythm" icon={<Wifi size={20} />} meta={`${mergedSnapshot.latencySeries.length} retained results · ${probeRhythm.series.length} targets`} />
+              <PanelHeading eyebrow="Latency trace" title="Probe rhythm" icon={<Wifi size={20} />} meta={`${visibleProbeHistory.length} browser-local results | ${probeRhythm.series.length} targets | 5h maximum`} />
               <SeriesSelector
                 label="Visible probe targets"
                 options={probeRhythm.series.map((series) => ({
@@ -933,42 +1333,29 @@ function App() {
                 selectedIds={selectedProbeTargets}
                 controls="probe-rhythm-chart"
                 onToggle={toggleProbeTarget}
+                action={<ChartExpandButton label="probe rhythm" onClick={() => openExpandedChart("probe")} />}
               />
-              <div id="probe-rhythm-chart">
-                <ResponsiveContainer width="100%" height={250}>
-                  <LineChart data={probeRhythm.points} margin={{ top: 0, right: 28, bottom: 0, left: 0 }}>
-                  <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
-                  <XAxis type="number" dataKey="timestamp" domain={["dataMin", "dataMax"]} tickFormatter={(value) => formatTime(Number(value))} stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" padding={{ left: 12, right: 12 }} />
-                  <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={52} tickFormatter={formatMillisecondsTick} />
-                  <Tooltip formatter={(value, name) => [formatMilliseconds(value), String(name)]} labelFormatter={(value) => formatDateTime(Number(value))} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
-                  {probeRhythm.series.filter((series) => selectedProbeTargets.includes(series.target)).map((series) => (
-                    <Line key={series.key} type="monotone" dataKey={series.key} connectNulls stroke={probeColorByTarget.get(series.target) || "var(--chart-5)"} strokeWidth={2} dot={false} name={series.target} isAnimationActive={false} />
-                  ))}
-                  </LineChart>
-                </ResponsiveContainer>
+              <div className="probe-chart-canvas" id="probe-rhythm-chart">
+                <ProbeTrendChart rhythm={probeRhythm} selectedTargets={selectedProbeTargets} colorByTarget={probeColorByTarget} />
               </div>
-              <p className="chart-note">Each target owns one continuous line. Failed probes stay in the counters and are never converted to 0 ms or connected to another target.</p>
+              <p className="chart-note">Up to 5 hours per browser session. Failed probes stay in the counters and are never converted to 0 ms or connected to another target.</p>
             </article>
 
             <article className="panel chart-panel event-signals">
-              <PanelHeading eyebrow="Event signals" title="Composition and cadence" icon={<Activity size={20} />} meta={`${events.length} events in browser memory`} />
+              <PanelHeading eyebrow="Event signals" title="Composition and cadence" icon={<Activity size={20} />} meta={`${events.length} events in browser memory | cadence capped at 5h`} />
               <div className="event-chart-grid">
                 <div>
                   <h3>Type composition</h3>
                   <EventTypeComposition items={mergedSnapshot.eventStats.byType} />
                 </div>
                 <div>
-                  <h3>Events per minute</h3>
-                  <ResponsiveContainer width="100%" height={215}>
-                    <AreaChart data={mergedSnapshot.eventStats.timeline} margin={{ top: 0, right: 28, bottom: 0, left: 0 }}>
-                      <defs><linearGradient id="eventGradient" x1="0" x2="0" y1="0" y2="1"><stop offset="5%" stopColor="var(--chart-2)" stopOpacity={0.3} /><stop offset="95%" stopColor="var(--chart-2)" stopOpacity={0.01} /></linearGradient></defs>
-                      <CartesianGrid stroke="var(--chart-grid-soft)" vertical={false} />
-                      <XAxis dataKey="time" stroke="var(--chart-axis)" tickLine={false} axisLine={false} minTickGap={30} interval="preserveStartEnd" padding={{ left: 12, right: 12 }} />
-                      <YAxis allowDecimals={false} stroke="var(--chart-axis)" tickLine={false} axisLine={false} width={34} />
-                      <Tooltip formatter={(value, name) => [formatCount(value), String(name)]} contentStyle={chartTooltipContentStyle} labelStyle={chartTooltipLabelStyle} itemStyle={chartTooltipItemStyle} />
-                      <Area type="monotone" dataKey="total" stroke="var(--chart-2)" fill="url(#eventGradient)" strokeWidth={2} name="Events" isAnimationActive={false} />
-                    </AreaChart>
-                  </ResponsiveContainer>
+                  <div className="event-chart-heading">
+                    <h3>Events per minute</h3>
+                    <ChartExpandButton label="events per minute" onClick={() => openExpandedChart("events")} />
+                  </div>
+                  <div className="event-cadence-canvas">
+                    <EventCadenceChart data={visibleEventTimeline} gradientId="event-gradient-inline" />
+                  </div>
                 </div>
               </div>
             </article>
@@ -1030,6 +1417,93 @@ function App() {
               ))}
             </div>
           </section>
+
+          {expandedChart && (
+            <ChartAnalysisDialog
+              title={expandedChartTitles[expandedChart]}
+              description={expandedChartDescriptions[expandedChart]}
+              sampleCount={expandedChartPoints.length}
+              span={formatChartSpan(expandedChartPoints)}
+              rangeMs={expandedRangeMs}
+              onRangeChange={setExpandedRangeMs}
+              onClose={() => setExpandedChart(null)}
+            >
+              {expandedChart === "traffic" && (
+                <>
+                  <SeriesSelector
+                    label="Visible traffic data"
+                    options={trafficSeriesOptions}
+                    selectedIds={selectedTrafficSeries}
+                    controls="expanded-traffic-chart"
+                    onToggle={toggleTrafficSeries}
+                  />
+                  <div className="chart-analysis-canvas" id="expanded-traffic-chart">
+                    <TrafficTrendChart
+                      data={expandedTrafficHistory}
+                      showThroughput={showTrafficThroughput}
+                      showPackets={showTrafficPackets}
+                      showFlows={showTrafficFlows}
+                      gradientId="traffic-gradient-expanded"
+                      expanded
+                    />
+                  </div>
+                </>
+              )}
+              {expandedChart === "cpu" && (
+                <>
+                  <SeriesSelector
+                    label="Visible CPU series"
+                    options={cpuSeriesOptions}
+                    selectedIds={selectedCpuSeries}
+                    controls="expanded-cpu-chart"
+                    onToggle={toggleCpuSeries}
+                  />
+                  <div className="chart-analysis-canvas" id="expanded-cpu-chart">
+                    <CpuTrendChart data={expandedResourceHistory} showEngine={showEngineCpu} showDashboard={showDashboardCpu} expanded />
+                  </div>
+                </>
+              )}
+              {expandedChart === "memory" && (
+                <>
+                  <SeriesSelector
+                    label="Visible RSS series"
+                    options={memorySeriesOptions}
+                    selectedIds={selectedMemorySeries}
+                    controls="expanded-memory-chart"
+                    onToggle={toggleMemorySeries}
+                  />
+                  <div className="chart-analysis-canvas" id="expanded-memory-chart">
+                    <MemoryTrendChart data={expandedResourceHistory} showEngine={showEngineMemory} showDashboard={showDashboardMemory} expanded />
+                  </div>
+                </>
+              )}
+              {expandedChart === "probe" && (
+                <>
+                  <SeriesSelector
+                    label="Visible probe targets"
+                    options={expandedProbeRhythm.series.map((series) => ({
+                      id: series.target,
+                      label: series.target,
+                      color: probeColorByTarget.get(series.target) || "var(--chart-5)",
+                      detail: `${series.successes} ok | ${series.failures} failed`,
+                      disabled: series.successes === 0
+                    }))}
+                    selectedIds={selectedProbeTargets}
+                    controls="expanded-probe-chart"
+                    onToggle={toggleProbeTarget}
+                  />
+                  <div className="chart-analysis-canvas" id="expanded-probe-chart">
+                    <ProbeTrendChart rhythm={expandedProbeRhythm} selectedTargets={selectedProbeTargets} colorByTarget={probeColorByTarget} expanded />
+                  </div>
+                </>
+              )}
+              {expandedChart === "events" && (
+                <div className="chart-analysis-canvas chart-analysis-canvas-single" id="expanded-events-chart">
+                  <EventCadenceChart data={expandedEventTimeline} gradientId="event-gradient-expanded" expanded />
+                </div>
+              )}
+            </ChartAnalysisDialog>
+          )}
         </>
       )}
     </main>
@@ -1254,21 +1728,26 @@ function SeriesSelector({
   options,
   selectedIds,
   controls,
-  onToggle
+  onToggle,
+  action
 }: {
   label: string;
   options: SeriesSelectorOption[];
   selectedIds: readonly string[];
   controls: string;
   onToggle: (id: string) => void;
+  action?: ReactNode;
 }) {
   const selectableCount = options.filter((option) => !option.disabled).length;
   const selectedCount = selectedIds.filter((id) => options.some((option) => option.id === id && !option.disabled)).length;
   return (
     <div className="series-picker">
       <div className="series-picker-heading">
-        <span>{label}</span>
-        <small>{selectedCount} of {selectableCount} shown</small>
+        <div>
+          <span>{label}</span>
+          <small>{selectedCount} of {selectableCount} shown</small>
+        </div>
+        {action}
       </div>
       <div className="series-options" role="group" aria-label={label}>
         {options.map((option) => {

@@ -1,5 +1,14 @@
 // Probe Rhythm 图表数据适配器：按探测目标隔离曲线，并保留失败与非法采样的空值语义。
 
+import {
+  CHART_SAMPLE_LIMIT,
+  CHART_WINDOW_MS,
+  trimChartWindow
+} from "./chart_window.mjs";
+
+// 最多按五个并行目标预留原始点，异常目标爆炸时仍有明确的浏览器内存保险丝。
+export const PROBE_HISTORY_LIMIT = CHART_SAMPLE_LIMIT * 5;
+
 // 时延只接受非负有限数；0 ms 是合法采样，失败、负数和非数值都保持为 null。
 function normalizeLatency(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -12,6 +21,36 @@ function normalizeTimestamp(value) {
   if (value === null || value === undefined || value === "") return null;
   const numeric = Number(value);
   return Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
+}
+
+/**
+ * 把 BFF 每轮返回的短历史增量合并为浏览器本地 5 小时窗口。
+ * target + timestamp 共同去重，避免不同目标恰好同刻采样时互相覆盖。
+ */
+export function mergeProbeHistory(history, incoming, options = {}) {
+  const combined = [
+    ...(Array.isArray(history) ? history : []),
+    ...(Array.isArray(incoming) ? incoming : [])
+  ];
+  const unique = new Map();
+
+  for (const item of combined) {
+    const target = String(item?.target ?? "").trim();
+    const timestamp = normalizeTimestamp(item?.timestamp);
+    if (!target || timestamp === null) continue;
+    unique.set(`${target}\u0000${timestamp}`, item);
+  }
+
+  const ordered = Array.from(unique.values()).sort((left, right) => (
+    Number(left.timestamp) - Number(right.timestamp)
+      || String(left.target).localeCompare(String(right.target))
+  ));
+
+  return trimChartWindow(ordered, {
+    now: options.now,
+    windowMs: CHART_WINDOW_MS,
+    maxPoints: options.maxPoints ?? PROBE_HISTORY_LIMIT
+  });
 }
 
 /**

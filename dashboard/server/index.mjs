@@ -33,6 +33,10 @@ import {
   createRetiringResourceTracker,
   sendWebSocketMessage
 } from "./resource_guards.mjs";
+import {
+  trimChartWindow
+} from "../src/lib/chart_window.mjs";
+import { buildEventStats } from "../src/lib/event_stats.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dashboardRoot = path.resolve(__dirname, "..");
@@ -625,17 +629,15 @@ function normalizeEvent(event) {
 // 保存最近事件并实施固定容量淘汰，防止本地服务长期运行时无限增长。
 function rememberEvent(event) {
   eventBuffer.push(event);
-  while (eventBuffer.length > maxEvents) {
-    eventBuffer.shift();
-  }
+  const retained = trimChartWindow(eventBuffer, { now: now(), maxPoints: maxEvents });
+  eventBuffer.splice(0, eventBuffer.length, ...retained);
 }
 
 // 保存最近 Ping 结果，供延迟趋势图跨 snapshot 展示。
 function rememberPing(ping) {
   pingHistory.push(ping);
-  while (pingHistory.length > maxPings) {
-    pingHistory.shift();
-  }
+  const retained = trimChartWindow(pingHistory, { now: now(), maxPoints: maxPings });
+  pingHistory.splice(0, pingHistory.length, ...retained);
 }
 
 // 广播前实施待发送字节上限；慢客户端会被断开，避免单个页面拖出无界发送缓冲区。
@@ -753,31 +755,6 @@ function parseHealth(details) {
   }
 }
 
-// 聚合事件类型分布和分钟级时间桶，生成图表直接消费的数据。
-function buildEventStats(events) {
-  const byTypeMap = new Map();
-  const buckets = new Map();
-
-  for (const event of events) {
-    byTypeMap.set(event.type, (byTypeMap.get(event.type) || 0) + 1);
-    const bucketTime = Math.floor(event.timestamp / 60000) * 60000;
-    const bucket = buckets.get(bucketTime) || { time: new Date(bucketTime).toLocaleTimeString(), total: 0 };
-    bucket.total += 1;
-    bucket[event.type] = (bucket[event.type] || 0) + 1;
-    buckets.set(bucketTime, bucket);
-  }
-
-  return {
-    byType: Array.from(byTypeMap.entries())
-      .map(([name, value]) => ({ name, value }))
-      .sort((a, b) => b.value - a.value),
-    timeline: Array.from(buckets.entries())
-      .sort(([a], [b]) => a - b)
-      .map(([, value]) => value)
-      .slice(-30)
-  };
-}
-
 // 把 Ping RPC 的成功或异常结果收敛为同一前端模型。
 function normalizePing(target, response, error = null) {
   const timestamp = now();
@@ -843,7 +820,13 @@ async function collectSnapshot() {
   }
 
   const pings = await Promise.all(pingTargets.map((target) => pingTarget(target)));
-  const recentEvents = eventBuffer.slice(-120);
+  const recentEvents = trimChartWindow(eventBuffer, {
+    now: generatedAt,
+    maxPoints: maxEvents
+  });
+  // 即使长时间没有新事件，也在 snapshot 读取时回收超过 5 小时的旧记录，
+  // 避免状态接口继续统计已经不参与趋势分析的数据。
+  eventBuffer.splice(0, eventBuffer.length, ...recentEvents);
   // 在本轮 RPC/探测完成后采样 BFF，使开销量化覆盖完整的一次 snapshot 编排工作。
   const runtimeResources = buildRuntimeResources(
     networkSnapshot?.engineResources ?? null,
@@ -877,7 +860,10 @@ async function collectSnapshot() {
     requestFailures,
     health,
     pings,
-    latencySeries: pingHistory.slice(-120).map((item) => ({
+    latencySeries: trimChartWindow(pingHistory, {
+      now: generatedAt,
+      maxPoints: maxPings
+    }).map((item) => ({
       // 保留原始毫秒时间戳，前端可以按真实采样顺序绘制，而不是依赖格式化后的时钟文本。
       timestamp: item.timestamp,
       time: new Date(item.timestamp).toLocaleTimeString(),
@@ -886,7 +872,7 @@ async function collectSnapshot() {
       success: item.success
     })),
     events: recentEvents,
-    eventStats: buildEventStats(recentEvents)
+    eventStats: buildEventStats(recentEvents, { now: generatedAt, maxEvents })
   };
 }
 
@@ -1110,7 +1096,7 @@ wss.on("connection", (socket) => {
     JSON.stringify({
       type: "hello",
       stream: { connected: streamConnected, error: streamError },
-      recentEvents: eventBuffer.slice(-30)
+      recentEvents: trimChartWindow(eventBuffer, { now: now(), maxPoints: 30 })
     }),
     wsMaxBufferedBytes
   );

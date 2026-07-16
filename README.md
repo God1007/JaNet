@@ -3,7 +3,7 @@
     src="docs/assets/janet-banner.png"
     alt="JaNet — AI-powered Network Diagnostics"
     width="520"
-    hight="210"
+    height="210"
   />
 </p>
 
@@ -42,7 +42,7 @@
 | Linux 网络观测 | Netlink、sock_diag、RTT、RSSI 可用性、TC/eBPF | 接口状态、流量、active flows 与采集可信度 |
 | 质量评估 | 对 RTT、RSSI、TCP 重传率代理值和流量进行结构化归一 | 质量等级、分数、问题列表和 degraded 原因 |
 | 可视化与事件流 | React + Vite、Dashboard BFF、WebSocket | 实时指标、事件变化、流量和诊断结果 |
-| 运行开销量化 | Linux `ProcessResourceSampler` + Node BFF 进程采样 | Engine/BFF 的 CPU、RSS、线程、FD、调度计数与 72 点页面趋势 |
+| 运行开销量化 | Linux `ProcessResourceSampler` + Node BFF 进程采样 | Engine/BFF 的 CPU、RSS、线程、FD、调度计数与最多 5 小时页面趋势 |
 | 真实请求失败观察 | Chrome MV3 `webRequest` + 本机有界聚合 | 用户实际 HTTP/HTTPS 的 4xx/5xx、浏览器网络错误、服务端 IP 与滑窗告警 |
 | AI / RAG 分析 | 服务端可选模型调用 + 本地知识检索 | 带证据的诊断建议；核心采集不依赖 API Key |
 
@@ -214,7 +214,7 @@ flowchart TB
 
   数据主链路是：**Linux 采集器 → ServerContext → gRPC Snapshot / Events → Dashboard BFF → 浏览器**。浏览器不会收到模型 API Key；AI 未配置时，基础采集、Dashboard 与 gRPC 接口仍可独立工作。
 
-  资源链路是：**`ProcessResourceSampler` → Proto `engine_resources` / `unavailable_metrics` → BFF 自身进程采样 → `runtimeResources` → 前端 72 点页面窗口**。Engine 指标始终来自 Linux C++ 进程；BFF 指标来自当前平台的 Node 进程。原生 Linux/WSL2 中两者位于同一 Linux 运行时，macOS 中则分别位于 Lima 与宿主机。
+  资源链路是：**`ProcessResourceSampler` → Proto `engine_resources` / `unavailable_metrics` → BFF 自身进程采样 → `runtimeResources` → 前端 5 小时 TTL 页面窗口**。Engine 指标始终来自 Linux C++ 进程；BFF 指标来自当前平台的 Node 进程。原生 Linux/WSL2 中两者位于同一 Linux 运行时，macOS 中则分别位于 Lima 与宿主机。
 
   真实请求失败链路是：**Chrome MV3 `webRequest` 旁路观察用户实际 HTTP/HTTPS 终态 → 本机 `POST /api/browser-failures` → `host + failureCode` 滑动窗口 → Dashboard 告警与筛选**。这条链路绝不是主动 HTTP probe：JaNet 不会为了采样去访问 GitHub 或其他业务 URL，只接收浏览器原本已经发生的请求结果。
 
@@ -249,9 +249,9 @@ flowchart TB
 | Dashboard WebSocket | 最多 32 个连接；单客户端待发送数据最多 256 KiB，慢客户端超限即断开 | `DASHBOARD_WS_MAX_CONNECTIONS`、`DASHBOARD_WS_MAX_BUFFERED_BYTES` |
 | 浏览器失败近期记录 | BFF 最多保留 500 条；按 host + failureCode 在 5 分钟窗口内累计 5 次触发告警 | `DASHBOARD_REQUEST_FAILURE_MAX_RECENT`、`DASHBOARD_REQUEST_FAILURE_WINDOW_SEC`、`DASHBOARD_REQUEST_FAILURE_THRESHOLD` |
 | Chrome 扩展待上报队列 | 最多 1,000 条，单批最多 100 条；固定 5 分钟 TTL，超过后丢弃并累计 dropped，避免恢复时重放陈旧突发 | 扩展内固定边界 |
-| 资源趋势 | Engine 与 BFF 的 CPU/RSS 只在当前页面保留最近 72 点 | 页面生命周期 |
+| Dashboard 曲线 | Traffic、CPU/RSS、Probe 与事件节奏最多展示最近 5 小时；10 秒曲线最多 1,801 点，Probe 原始样本最多 9,005 条；支持放大后切换 30 分钟/1 小时/5 小时 | 页面生命周期；BFF 事件与短 Ping 种子受独立进程上限保护 |
 
-  浏览器中的事件、Ping 和 traffic 曲线是**有界实时窗口**，刷新页面后不会恢复。日级或月级历史由外部时序存储承接，并按查询跨度提供分钟或小时粒度的降采样数据；当前版本不包含历史持久化查询。
+  浏览器中的事件、Ping、traffic 与进程资源曲线是**最多 5 小时的有界实时窗口**，刷新页面后不会恢复浏览器本地部分。所有曲线使用数值时间轴，事件节奏会补齐无事件分钟；放大视图只改变分析范围，不扩大保留边界。日级或月级历史由外部时序存储承接，并按查询跨度提供分钟或小时粒度的降采样数据；当前版本不包含历史持久化查询。
 
 ## Linux 手动构建
 

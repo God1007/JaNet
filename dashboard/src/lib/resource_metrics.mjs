@@ -1,6 +1,12 @@
-// 资源看板纯函数：规范化可缺失的进程指标，并维护固定 72 点的浏览器本地趋势。
+// 资源看板纯函数：规范化可缺失的进程指标，并维护最近 5 小时的浏览器本地趋势。
 
-export const RESOURCE_HISTORY_LIMIT = 72;
+import {
+  CHART_SAMPLE_LIMIT,
+  CHART_WINDOW_MS,
+  trimChartWindow
+} from "./chart_window.mjs";
+
+export const RESOURCE_HISTORY_LIMIT = CHART_SAMPLE_LIMIT;
 
 const byteUnits = ["B", "KiB", "MiB", "GiB", "TiB"];
 const countFormatter = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
@@ -43,7 +49,7 @@ export function createResourceSample(runtimeResources) {
   };
 }
 
-// 同一采样时刻覆盖末项；其余采样按到达顺序追加，并始终裁剪到固定上限。
+// 同一采样时刻覆盖末项；其余采样按到达顺序追加，并按 5 小时 TTL 与点数上限双重裁剪。
 export function appendResourceSample(history, sample, limit = RESOURCE_HISTORY_LIMIT) {
   const numericLimit = Number(limit);
   const safeLimit = Number.isFinite(numericLimit) && numericLimit > 0
@@ -52,9 +58,17 @@ export function appendResourceSample(history, sample, limit = RESOURCE_HISTORY_L
   const previous = history.at(-1);
 
   if (previous?.timestamp === sample.timestamp) {
-    return [...history.slice(0, -1), sample].slice(-safeLimit);
+    return trimChartWindow([...history.slice(0, -1), sample], {
+      now: sample.timestamp,
+      windowMs: CHART_WINDOW_MS,
+      maxPoints: safeLimit
+    });
   }
-  return [...history, sample].slice(-safeLimit);
+  return trimChartWindow([...history, sample], {
+    now: sample.timestamp,
+    windowMs: CHART_WINDOW_MS,
+    maxPoints: safeLimit
+  });
 }
 
 // 内存按 1024 进位展示；合法 0 B 与不可用 n/a 保持严格区分。

@@ -19,6 +19,14 @@ export type ProbeRhythmSeries = {
   failures: number;
 };
 
+export const PROBE_HISTORY_LIMIT: number;
+
+export function mergeProbeHistory<T extends ProbeRhythmInput>(
+  history: readonly T[] | null | undefined,
+  incoming: readonly T[] | null | undefined,
+  options?: { now?: number; maxPoints?: number }
+): T[];
+
 export function buildProbeRhythm(
   items: readonly ProbeRhythmInput[] | null | undefined
 ): {

@@ -1,5 +1,13 @@
 // 流量看板纯函数：统一单位、构造趋势采样，并隔离服务重启与计数器重置语义。
 
+import {
+  CHART_SAMPLE_LIMIT,
+  CHART_WINDOW_MS,
+  trimChartWindow
+} from "./chart_window.mjs";
+
+export const TRAFFIC_HISTORY_LIMIT = CHART_SAMPLE_LIMIT;
+
 const byteUnits = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"];
 const packetUnits = ["pkt/s", "K pkt/s", "M pkt/s", "B pkt/s", "T pkt/s"];
 const countFormatter = new Intl.NumberFormat("en-US", {
@@ -104,12 +112,12 @@ export function createTrafficSample(networkSnapshot) {
   };
 }
 
-// 维护不可变的固定长度历史；同代更新覆盖末项，代数回退代表服务重启并清空旧曲线。
-export function appendTrafficSample(history, sample, limit = 60) {
+// 维护不可变的 5 小时历史；同代更新覆盖末项，代数回退代表服务重启并清空旧曲线。
+export function appendTrafficSample(history, sample, limit = TRAFFIC_HISTORY_LIMIT) {
   const numericLimit = Number(limit);
   const safeLimit = Number.isFinite(numericLimit) && numericLimit > 0
     ? Math.max(1, Math.trunc(numericLimit))
-    : 60;
+    : TRAFFIC_HISTORY_LIMIT;
   const previous = history.at(-1);
 
   if (!previous || sample.generation < previous.generation) {
@@ -117,10 +125,18 @@ export function appendTrafficSample(history, sample, limit = 60) {
   }
 
   if (sample.generation === previous.generation) {
-    return [...history.slice(0, -1), sample].slice(-safeLimit);
+    return trimChartWindow([...history.slice(0, -1), sample], {
+      now: sample.timestamp,
+      windowMs: CHART_WINDOW_MS,
+      maxPoints: safeLimit
+    });
   }
 
-  return [...history, sample].slice(-safeLimit);
+  return trimChartWindow([...history, sample], {
+    now: sample.timestamp,
+    windowMs: CHART_WINDOW_MS,
+    maxPoints: safeLimit
+  });
 }
 
 // 累计计数器只有单调递增时才计算窗口增量；回退返回 null 提醒 UI 发生了重置。

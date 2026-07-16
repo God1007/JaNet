@@ -6,6 +6,7 @@ export function formatBytesPerSecond(value: unknown, fallback?: string): string;
 export function formatPacketsPerSecond(value: unknown, fallback?: string): string;
 export function formatCount(value: unknown, fallback?: string): string;
 export function formatPercent(value: unknown, fallback?: string): string;
+export const TRAFFIC_HISTORY_LIMIT: number;
 export function createTrafficSample(networkSnapshot: NetworkSnapshot | null): TrafficSample | null;
 export function appendTrafficSample(
   history: readonly TrafficSample[],

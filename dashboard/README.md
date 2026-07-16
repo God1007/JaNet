@@ -7,7 +7,8 @@ Local dashboard for the gRPC version of AI-powered Network Diagnostics.
 - Reads WeakNet data through `proto/weaknet.proto`.
 - Shows interfaces, network quality, event mix, event cadence and ping latency.
 - Streams server events over a local WebSocket.
-- Quantifies the Linux Engine and Node BFF process footprint, with a browser-local 72-point CPU/RSS window.
+- Quantifies the Linux Engine and Node BFF process footprint, with browser-local CPU/RSS trends capped at five hours and 1,801 points.
+- Gives every trend chart an expanded analysis view with 30-minute, 1-hour and 5-hour ranges, shared series controls and exact timestamp tooltips.
 - Aggregates failures from the optional Chrome MV3 collector by host and failure code, then exposes sliding-window alerts and filters.
 - Runs AI diagnosis from the dashboard server only. The browser never receives the API key.
 
@@ -139,12 +140,14 @@ The dashboard is a bounded real-time view, not a historical database.
 
 | Data | In-memory bound | Reset boundary |
 | --- | --- | --- |
-| Live traffic | Latest `72` trusted generations; at the default 10-second polling interval this is about 12 minutes | Browser page reload or close |
-| Runtime CPU/RSS trends | Latest `72` page samples for both Engine and BFF | Browser page reload or close |
-| Events | BFF keeps `300`; snapshot/UI consume the latest `120`; WebSocket hello sends `30` | Dashboard BFF restart |
-| Ping probes | BFF keeps `240` across all targets and snapshot returns the latest `120` | Dashboard BFF restart |
+| Live traffic | Five-hour TTL plus `1,801` trusted-generation cap; the normal 10-second cadence can cover the full window | Browser page reload or close |
+| Runtime CPU/RSS trends | Five-hour TTL plus `1,801` shared page samples for Engine and BFF | Browser page reload or close |
+| Events | Raw BFF events use a five-hour TTL and `300`-row cap; cadence returns continuous minute buckets so idle gaps remain visible; the UI event list remains `120` rows and WebSocket hello sends `30` | Dashboard BFF restart |
+| Ping probes | BFF seeds the page with at most `240` rows; the browser merges target + timestamp increments into a five-hour TTL window with a `9,005`-row fail-safe | Browser page reload or close; BFF seed resets on BFF restart |
 | Browser failures | BFF keeps latest `500`; alert groups use a 300-second host + failure-code window by default | Dashboard BFF restart |
 | Extension retry queue | Latest `1,000` failures in `chrome.storage.local`, sent in batches of at most `100` with bounded backoff | Extension storage reset/removal |
+
+All five trend charts use numeric timestamps and never display data older than five hours. Traffic, CPU, memory and Probe use browser-local history; Events per minute is built from BFF event evidence. Expanded charts can narrow the visible range without changing retention.
 
 Day- or month-scale history must be exported to a time-series database. Preserve
 timestamps, generation and availability/validity fields, control high-cardinality
