@@ -2,11 +2,19 @@
 
 import React from "react";
 import ReactDOM from "react-dom/client";
-import App from "./App";
 import "./styles.css";
+
+// 大体积 Recharts 随 Dashboard 主体异步加载，浏览器可先绘制稳定骨架而不是等待整包解析。
+const App = React.lazy(() => import("./App"));
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <App />
+    <React.Suspense fallback={(
+      <main className="app-shell" aria-busy="true">
+        <section className="skeleton-grid" aria-label="Loading dashboard"><div /><div /><div /></section>
+      </main>
+    )}>
+      <App />
+    </React.Suspense>
   </React.StrictMode>
 );

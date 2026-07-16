@@ -7,6 +7,8 @@ Local dashboard for the gRPC version of AI-powered Network Diagnostics.
 - Reads WeakNet data through `proto/weaknet.proto`.
 - Shows interfaces, network quality, event mix, event cadence and ping latency.
 - Streams server events over a local WebSocket.
+- Reconnects the browser event channel with bounded backoff and keeps BFF transport state separate from the upstream gRPC stream state.
+- Pauses snapshot polling in hidden/offline tabs, applies request deadlines, and batches event bursts before React renders them.
 - Quantifies the Linux Engine and Node BFF process footprint, with browser-local CPU/RSS trends capped at five hours and 1,801 points.
 - Gives every trend chart an expanded analysis view with 30-minute, 1-hour and 5-hour ranges, shared series controls and exact timestamp tooltips.
 - Aggregates failures from the optional Chrome MV3 collector by host and failure code, then exposes sliding-window alerts and filters.
@@ -120,6 +122,7 @@ See [the collector guide](../browser-extension/README.md), the official [Chrome 
 - `DASHBOARD_ANALYZE_MAX_CONCURRENCY`: maximum concurrent `/api/analyze` requests. Default `2`; overflow returns HTTP 429 instead of queuing.
 - `DASHBOARD_WS_MAX_CONNECTIONS`: maximum dashboard WebSocket connections. Default `32`.
 - `DASHBOARD_WS_MAX_BUFFERED_BYTES`: maximum queued outbound bytes per WebSocket before a slow client is disconnected. Default `262144` (256 KiB).
+- `DASHBOARD_SNAPSHOT_CACHE_TTL_MS`: short successful-snapshot cache used with single-flight collection. Default `2000` ms and capped at `10000`; AI analysis and an explicit Dashboard refresh bypass completed cache entries.
 - `DASHBOARD_REQUEST_FAILURE_WINDOW_SEC`: host + failure-code sliding alert window in seconds. Default `300`.
 - `DASHBOARD_REQUEST_FAILURE_THRESHOLD`: matching failures required in the window before an alert fires. Default `5`.
 - `DASHBOARD_REQUEST_FAILURE_MAX_RECENT`: maximum recent browser failures retained by the BFF. Default `500`.
@@ -137,6 +140,8 @@ See [the collector guide](../browser-extension/README.md), the official [Chrome 
 ## Runtime limits and history semantics
 
 The dashboard is a bounded real-time view, not a historical database.
+
+Concurrent snapshot requests share one in-flight collection, while the typed network snapshot and default Ping targets run in parallel. A successful result is reusable only within the configured short TTL. This removes duplicate work from simultaneous tabs and avoids serial RPC/Ping tail latency without turning the Dashboard into a historical cache. A single first request can still wait for the slowest default Ping target; browser-side deadlines prevent that wait from permanently blocking later refreshes.
 
 | Data | In-memory bound | Reset boundary |
 | --- | --- | --- |

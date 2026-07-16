@@ -19,5 +19,26 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     port: webPort
+  },
+  build: {
+    // React 首屏、Dashboard 业务和图表引擎拆包，降低首次脚本下载与解析的阻塞时间。
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: "react-runtime",
+              test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/,
+              priority: 20
+            },
+            {
+              name: "chart-runtime",
+              test: /node_modules[\\/](?:recharts|victory-vendor|react-is|d3-[^\\/]+)[\\/]/,
+              priority: 10
+            }
+          ]
+        }
+      }
+    }
   }
 });

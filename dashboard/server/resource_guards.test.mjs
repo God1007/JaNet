@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   admitWebSocketConnection,
   boundedInteger,
+  createCachedSingleFlight,
   createConcurrencyGate,
   createRetiringResourceTracker,
   sendWebSocketMessage
@@ -35,6 +36,87 @@ test("concurrency gate rejects overflow and releases exactly once", () => {
   releaseSecond();
   releaseThird();
   assert.equal(gate.active, 0);
+});
+
+test("cached single-flight coalesces concurrent work and caches from completion time", async () => {
+  let now = 1000;
+  let calls = 0;
+  let resolveLoad;
+  const loader = createCachedSingleFlight(() => {
+    calls += 1;
+    return new Promise((resolve) => {
+      resolveLoad = resolve;
+    });
+  }, { ttlMs: 2000, clock: () => now });
+
+  const first = loader.load();
+  const second = loader.load({ force: true });
+  const third = loader.load();
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  now = 5000;
+  resolveLoad({ generation: 1 });
+  assert.deepEqual(await Promise.all([first, second, third]), [
+    { generation: 1 },
+    { generation: 1 },
+    { generation: 1 }
+  ]);
+
+  now = 6999;
+  assert.deepEqual(await loader.load(), { generation: 1 });
+  assert.equal(calls, 1, "TTL starts when the expensive load resolves");
+});
+
+test("cached single-flight expires, force bypasses cache, and invalidation is explicit", async () => {
+  let now = 1000;
+  let calls = 0;
+  const loader = createCachedSingleFlight(async () => ({ generation: ++calls }), {
+    ttlMs: 2000,
+    clock: () => now
+  });
+
+  assert.deepEqual(await loader.load(), { generation: 1 });
+  assert.deepEqual(await loader.load({ force: true }), { generation: 2 });
+  now = 4001;
+  assert.deepEqual(await loader.load(), { generation: 3 });
+  loader.invalidate();
+  assert.deepEqual(await loader.load(), { generation: 4 });
+});
+
+test("cached single-flight never caches a rejection", async () => {
+  let calls = 0;
+  const loader = createCachedSingleFlight(async () => {
+    calls += 1;
+    if (calls === 1) throw new Error("temporary failure");
+    return "recovered";
+  }, { ttlMs: 2000 });
+
+  await assert.rejects(loader.load(), /temporary failure/);
+  assert.equal(loader.inFlight, false);
+  assert.equal(await loader.load(), "recovered");
+  assert.equal(calls, 2);
+});
+
+test("invalidation during an in-flight load prevents that result from repopulating cache", async () => {
+  let calls = 0;
+  let resolveFirst;
+  const loader = createCachedSingleFlight(() => {
+    calls += 1;
+    if (calls === 1) {
+      return new Promise((resolve) => {
+        resolveFirst = resolve;
+      });
+    }
+    return Promise.resolve(`value-${calls}`);
+  }, { ttlMs: 2000 });
+
+  const first = loader.load();
+  await Promise.resolve();
+  loader.invalidate();
+  resolveFirst("stale-for-cache");
+  assert.equal(await first, "stale-for-cache");
+  assert.equal(await loader.load(), "value-2");
+  assert.equal(calls, 2);
 });
 
 test("retiring resource waits for in-flight operations before closing", () => {

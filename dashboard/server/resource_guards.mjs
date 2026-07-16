@@ -43,6 +43,53 @@ export function createConcurrencyGate(limit) {
   };
 }
 
+// 把昂贵的快照采集合并为 single-flight，并只缓存最近一次成功结果的短 TTL。
+export function createCachedSingleFlight(loader, { ttlMs = 0, clock = Date.now } = {}) {
+  if (typeof loader !== "function") throw new TypeError("loader must be a function");
+  if (typeof clock !== "function") throw new TypeError("clock must be a function");
+  const safeTtlMs = Math.max(0, Number(ttlMs) || 0);
+  let cached = null;
+  let inFlight = null;
+  let invalidationVersion = 0;
+
+  async function load({ force = false } = {}) {
+    // force 只绕过旧缓存，不复制一轮已经开始的底层采集。
+    if (inFlight) return inFlight;
+    const currentTime = Number(clock());
+    if (!force && safeTtlMs > 0 && cached
+        && Number.isFinite(currentTime)
+        && currentTime - cached.resolvedAt <= safeTtlMs) {
+      return cached.value;
+    }
+
+    const loadVersion = invalidationVersion;
+    const current = Promise.resolve().then(loader);
+    inFlight = current;
+    try {
+      const value = await current;
+      // 采集期间若有写操作 invalidate，本轮结果仍返回给等待者，但不能重新污染短缓存。
+      if (loadVersion === invalidationVersion) {
+        cached = { value, resolvedAt: Number(clock()) };
+      }
+      return value;
+    } finally {
+      // 失败不会改写 cached；同一 Promise 才能释放当前 single-flight 槽位。
+      if (inFlight === current) inFlight = null;
+    }
+  }
+
+  return {
+    load,
+    invalidate() {
+      invalidationVersion += 1;
+      cached = null;
+    },
+    get inFlight() {
+      return inFlight !== null;
+    }
+  };
+}
+
 // 资源进入 retiring 后等待其在途操作归零再关闭，避免切换连接时打断正在执行的 RPC。
 export function createRetiringResourceTracker(closeResource) {
   const states = new WeakMap();

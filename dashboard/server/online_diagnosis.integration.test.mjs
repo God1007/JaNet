@@ -287,6 +287,8 @@ test("analyze uses one typed snapshot and returns the unified RAG contract", { t
       ...process.env,
       DASHBOARD_API_PORT: String(apiPort),
       DASHBOARD_PING_TARGETS: "127.0.0.1",
+      // 本用例需要三次独立 typed snapshot 验证不同载荷；短缓存由 resource_guards 单测覆盖。
+      DASHBOARD_SNAPSHOT_CACHE_TTL_MS: "0",
       DASHBOARD_RAG_TIMEOUT_MS: "10000",
       WEAKNET_RAG_PYTHON: resolveRagPython(),
       RAG_RAW_PATH: rawPath,
