@@ -33,12 +33,13 @@ import {
   XAxis,
   YAxis
 } from "recharts";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 import type {
   InterfaceSnapshot,
   EventTimelinePoint,
   NetworkEvent,
+  PingResult,
   ProcessResourceMetrics,
   RequestFailureAlert,
   RequestFailureCategory,
@@ -49,6 +50,12 @@ import type {
   TrafficMapObservability,
   TrafficSample
 } from "./lib/types";
+import { fetchJson, isAbortError } from "./lib/http_client.mjs";
+import {
+  createEventBatcher,
+  mergeEventHistory,
+  reconnectDelay
+} from "./lib/realtime_lifecycle.mjs";
 import {
   CHART_SAMPLE_LIMIT,
   CHART_WINDOW_LABEL,
@@ -113,6 +120,11 @@ const requestFailureVisibleLimit = 50;
 const requestAlertVisibleLimit = 12;
 const chartTickOneDecimal = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
 const chartTickTwoDecimals = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+const snapshotRefreshIntervalMs = 10_000;
+const snapshotRequestTimeoutMs = 20_000;
+const pingRequestTimeoutMs = 12_000;
+const analysisRequestTimeoutMs = 35_000;
+const manualPingResultLimit = 16;
 
 // 所有趋势图共用一套紧凑 Tooltip 外观，避免 Recharts 默认的 16px 文本压过图表本身。
 const chartTooltipContentStyle = {
@@ -299,41 +311,242 @@ function formatChartSpan(items: readonly { timestamp: number }[]) {
   return remainder ? `${hours}h ${remainder}m span` : `${hours}h span`;
 }
 
-// 管理浏览器到 BFF 的 WebSocket，并把首连历史和实时增量统一交给事件 reducer。
-function useEventStream(onEvent: (event: NetworkEvent) => void) {
-  const [connected, setConnected] = useState(false);
-  const [error, setError] = useState("");
+type EventStreamPhase = "connecting" | "live" | "recovering" | "reconnecting" | "paused" | "offline";
+
+type EventStreamState = {
+  transportConnected: boolean;
+  sourceConnected: boolean;
+  phase: EventStreamPhase;
+  error: string;
+  retryInMs: number | null;
+};
+
+// 管理浏览器到 BFF 的 WebSocket：区分传输层和上游 gRPC 状态，并在断线后自动恢复。
+function useEventStream(onEvents: (events: NetworkEvent[]) => void) {
+  const [state, setState] = useState<EventStreamState>({
+    transportConnected: false,
+    sourceConnected: false,
+    phase: "connecting",
+    error: "",
+    retryInMs: null
+  });
 
   useEffect(() => {
-    const socket = new WebSocket(`${wsBaseUrl}/ws/events`);
+    let disposed = false;
+    let socket: WebSocket | null = null;
+    let retryTimer: number | null = null;
+    let reconnectAttempt = 0;
+    let connectionGeneration = 0;
+    const eventBatcher = createEventBatcher<NetworkEvent>(onEvents, {
+      delayMs: 100,
+      maxBatchSize: 64
+    });
 
-    socket.onopen = () => {
-      setConnected(true);
-      setError("");
-    };
-
-    socket.onmessage = (message) => {
-      try {
-        const payload = JSON.parse(message.data);
-        if (payload.type === "event") onEvent(payload.event);
-        if (payload.type === "hello" && Array.isArray(payload.recentEvents)) {
-          payload.recentEvents.forEach(onEvent);
-        }
-        if (payload.type === "stream") {
-          setConnected(Boolean(payload.connected));
-          setError(payload.error || "");
-        }
-      } catch {
-        setError("Dashboard received an invalid event payload");
+    const patchState = (patch: Partial<EventStreamState>) => {
+      if (!disposed) {
+        setState((current) => {
+          const changed = Object.entries(patch).some(([key, value]) => (
+            current[key as keyof EventStreamState] !== value
+          ));
+          return changed ? { ...current, ...patch } : current;
+        });
       }
     };
 
-    socket.onerror = () => setError("Dashboard event socket failed");
-    socket.onclose = () => setConnected(false);
-    return () => socket.close();
-  }, [onEvent]);
+    const clearRetry = () => {
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+    };
 
-  return { connected, error };
+    const scheduleReconnect = (message = "Event stream disconnected. Reconnecting automatically.") => {
+      if (disposed || retryTimer !== null) return;
+      const delay = reconnectDelay(reconnectAttempt, { jitterRatio: 0.2 });
+      reconnectAttempt += 1;
+      patchState({
+        transportConnected: false,
+        sourceConnected: false,
+        phase: "reconnecting",
+        error: message,
+        retryInMs: delay
+      });
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        connect();
+      }, delay);
+    };
+
+    function connect() {
+      if (disposed || socket || navigator.onLine === false || document.visibilityState === "hidden") return;
+      clearRetry();
+      const generation = ++connectionGeneration;
+      patchState({
+        transportConnected: false,
+        sourceConnected: false,
+        phase: "connecting",
+        retryInMs: null
+      });
+
+      let nextSocket: WebSocket;
+      try {
+        nextSocket = new WebSocket(`${wsBaseUrl}/ws/events`);
+      } catch {
+        // 配置错误或 mixed-content 限制也进入同一有界退避，避免 effect 同步崩溃。
+        scheduleReconnect("Dashboard cannot open the event socket. Retrying automatically.");
+        return;
+      }
+      socket = nextSocket;
+
+      nextSocket.onopen = () => {
+        if (disposed || socket !== nextSocket || generation !== connectionGeneration) return;
+        // WebSocket open 只证明页面连到 BFF；上游事件源必须等待 hello/stream 证据。
+        patchState({ transportConnected: true, phase: "connecting", retryInMs: null });
+      };
+
+      nextSocket.onmessage = (message) => {
+        if (disposed || socket !== nextSocket || generation !== connectionGeneration) return;
+        try {
+          const payload = JSON.parse(String(message.data));
+          if (payload.type === "event" && payload.event) {
+            eventBatcher.push(payload.event);
+            // 收到真实事件本身就是上游恢复的强证据，避免状态停留在旧 offline。
+            reconnectAttempt = 0;
+            patchState({ sourceConnected: true, phase: "live", error: "", retryInMs: null });
+          }
+          if (payload.type === "hello") {
+            if (Array.isArray(payload.recentEvents)) eventBatcher.pushMany(payload.recentEvents);
+            const sourceConnected = Boolean(payload.stream?.connected);
+            const sourceError = payload.stream?.error || "";
+            reconnectAttempt = 0;
+            patchState({
+              transportConnected: true,
+              sourceConnected,
+              phase: sourceConnected ? "live" : sourceError ? "recovering" : "connecting",
+              error: sourceError,
+              retryInMs: null
+            });
+          }
+          if (payload.type === "stream") {
+            const sourceConnected = Boolean(payload.connected);
+            patchState({
+              sourceConnected,
+              phase: sourceConnected ? "live" : "recovering",
+              error: payload.error || "",
+              retryInMs: null
+            });
+          }
+        } catch {
+          patchState({ error: "Dashboard received an invalid event payload" });
+        }
+      };
+
+      nextSocket.onerror = () => {
+        if (disposed || socket !== nextSocket) return;
+        patchState({ error: "Dashboard event socket failed" });
+        nextSocket.close();
+      };
+
+      nextSocket.onclose = () => {
+        if (disposed || socket !== nextSocket || generation !== connectionGeneration) return;
+        socket = null;
+        if (navigator.onLine === false) {
+          patchState({
+            transportConnected: false,
+            sourceConnected: false,
+            phase: "offline",
+            error: "Browser is offline. Live events will resume automatically.",
+            retryInMs: null
+          });
+          return;
+        }
+        if (document.visibilityState === "hidden") {
+          patchState({
+            transportConnected: false,
+            sourceConnected: false,
+            phase: "paused",
+            error: "",
+            retryInMs: null
+          });
+          return;
+        }
+
+        scheduleReconnect();
+      };
+    }
+
+    const reconnectNow = () => {
+      if (disposed || navigator.onLine === false || document.visibilityState === "hidden") return;
+      clearRetry();
+      if (!socket || socket.readyState === WebSocket.CLOSED) {
+        socket = null;
+        connect();
+      }
+    };
+    const handleOffline = () => {
+      clearRetry();
+      connectionGeneration += 1;
+      const currentSocket = socket;
+      socket = null;
+      patchState({
+        transportConnected: false,
+        sourceConnected: false,
+        phase: "offline",
+        error: "Browser is offline. Live events will resume automatically.",
+        retryInMs: null
+      });
+      currentSocket?.close();
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        reconnectNow();
+        return;
+      }
+      clearRetry();
+      eventBatcher.flush();
+      connectionGeneration += 1;
+      const currentSocket = socket;
+      socket = null;
+      patchState({
+        transportConnected: false,
+        sourceConnected: false,
+        phase: "paused",
+        error: "",
+        retryInMs: null
+      });
+      // 隐藏标签页不消费实时事件；恢复时 hello + snapshot 会补回有界历史。
+      currentSocket?.close();
+    };
+
+    window.addEventListener("online", reconnectNow);
+    window.addEventListener("offline", handleOffline);
+    document.addEventListener("visibilitychange", handleVisibility);
+    connect();
+
+    return () => {
+      disposed = true;
+      connectionGeneration += 1;
+      clearRetry();
+      window.removeEventListener("online", reconnectNow);
+      window.removeEventListener("offline", handleOffline);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      // effect cleanup 丢弃旧连接尚未提交的批次，避免 StrictMode/卸载阶段回写状态。
+      eventBatcher.discard();
+      if (socket) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        socket.close();
+        socket = null;
+      }
+    };
+  }, [onEvents]);
+
+  return {
+    ...state,
+    connected: state.transportConnected && state.sourceConnected
+  };
 }
 
 const chartCursor = {
@@ -508,6 +721,13 @@ function EventCadenceChart({
   );
 }
 
+// 实时事件只影响事件相关区域；稳定 props 的重图表跳过整页事件批次带来的无关重绘。
+const MemoTrafficTrendChart = memo(TrafficTrendChart);
+const MemoCpuTrendChart = memo(CpuTrendChart);
+const MemoMemoryTrendChart = memo(MemoryTrendChart);
+const MemoProbeTrendChart = memo(ProbeTrendChart);
+const MemoEventCadenceChart = memo(EventCadenceChart);
+
 function ChartExpandButton({ label, onClick }: { label: string; onClick: () => void }) {
   return (
     <button className="chart-expand-button" type="button" aria-haspopup="dialog" onClick={onClick}>
@@ -641,6 +861,7 @@ function App() {
   const [trafficHistory, setTrafficHistory] = useState<TrafficSample[]>([]);
   const [resourceHistory, setResourceHistory] = useState<ResourceSample[]>([]);
   const [probeHistory, setProbeHistory] = useState<Snapshot["latencySeries"]>([]);
+  const [manualPingResults, setManualPingResults] = useState<PingResult[]>([]);
   const [selectedTrafficSeries, setSelectedTrafficSeries] = useState<string[]>(["bytesPerSecond"]);
   const [selectedCpuSeries, setSelectedCpuSeries] = useState<string[]>(cpuSeriesIds);
   const [selectedMemorySeries, setSelectedMemorySeries] = useState<string[]>(memorySeriesIds);
@@ -658,7 +879,17 @@ function App() {
   const [expandedChart, setExpandedChart] = useState<ExpandedChartId | null>(null);
   const [expandedRangeMs, setExpandedRangeMs] = useState<number>(CHART_WINDOW_MS);
   const [chartNow, setChartNow] = useState(() => Date.now());
-  const requestInFlight = useRef(false);
+  const componentActiveRef = useRef(true);
+  const snapshotAvailableRef = useRef(false);
+  const snapshotRequestIdRef = useRef(0);
+  const snapshotFinishedAtRef = useRef(0);
+  const snapshotRequestRef = useRef<{
+    id: number;
+    controller: AbortController;
+    promise: Promise<void>;
+  } | null>(null);
+  const analysisAbortRef = useRef<AbortController | null>(null);
+  const pingAbortRef = useRef<AbortController | null>(null);
 
   // 用户选择持久化到浏览器，并同步原生控件和浏览器顶部主题色。
   useEffect(() => {
@@ -675,72 +906,173 @@ function App() {
     }
   }, [theme]);
 
-  // 即使采集停住也每分钟推进可见窗口，确保超过 5 小时的旧线不会永久留在屏幕上。
+  // 页面隐藏时停止纯展示时钟，回到前台立即推进窗口，避免后台标签持续触发整页计算。
   useEffect(() => {
-    const timer = window.setInterval(() => setChartNow(Date.now()), 60 * 1000);
-    return () => window.clearInterval(timer);
+    const advanceChartClock = () => {
+      if (document.visibilityState === "visible") setChartNow(Date.now());
+    };
+    const timer = window.setInterval(advanceChartClock, 60 * 1000);
+    document.addEventListener("visibilitychange", advanceChartClock);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", advanceChartClock);
+    };
   }, []);
 
-  // 按事件 id 去重；类型构成和分钟趋势共享同一份 5 小时、300 条上限的证据集。
-  const onEvent = useCallback((event: NetworkEvent) => {
-    setEvents((current) => {
-      if (current.some((item) => item.id === event.id)) return current;
-      return trimChartWindow(
-        [...current, event].sort((left, right) => left.timestamp - right.timestamp),
-        { now: Date.now(), maxPoints: EVENT_HISTORY_LIMIT }
-      );
+  // 一批事件只触发一次去重、排序和 React 提交；transition 保证突发事件不阻塞用户操作。
+  const onEvents = useCallback((incoming: NetworkEvent[]) => {
+    startTransition(() => {
+      setEvents((current) => mergeEventHistory(current, incoming, {
+        now: Date.now(),
+        maxPoints: EVENT_HISTORY_LIMIT
+      }));
     });
   }, []);
 
-  const eventStream = useEventStream(onEvent);
+  const eventStream = useEventStream(onEvents);
 
-  // 每次 snapshot 只追加一个可信 generation；同代替换，服务重启时自动切断旧趋势。
-  const loadSnapshot = useCallback(async () => {
-    if (requestInFlight.current) return;
-    requestInFlight.current = true;
-    setRefreshing(true);
-    try {
-      setError("");
-      const response = await fetch(`${apiBaseUrl}/api/snapshot`);
-      if (!response.ok) throw new Error(await response.text());
-      const next = (await response.json()) as Snapshot;
-      setSnapshot(next);
-      setLastUpdatedAt(Date.now());
-      setChartNow(Date.now());
-      const trafficSample = createTrafficSample(next.networkSnapshot);
-      if (trafficSample) {
-        setTrafficHistory((current) => appendTrafficSample(current, trafficSample));
-      }
-      const resourceSample = createResourceSample(next.runtimeResources);
-      if (resourceSample) {
-        setResourceHistory((current) => appendResourceSample(current, resourceSample));
-      }
-      setProbeHistory((current) => mergeProbeHistory(current, next.latencySeries, {
-        now: next.generatedAt,
-        maxPoints: PROBE_HISTORY_LIMIT
-      }));
-      setEvents((current) => {
-        const merged = [...current, ...next.events];
-        const unique = new Map(merged.map((event) => [event.id, event]));
-        return trimChartWindow(
-          Array.from(unique.values()).sort((left, right) => left.timestamp - right.timestamp),
-          { now: next.generatedAt, maxPoints: EVENT_HISTORY_LIMIT }
-        );
-      });
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      requestInFlight.current = false;
-      setRefreshing(false);
-      setLoading(false);
+  // 每次 snapshot 只追加一个可信 generation；请求有 deadline，旧/取消结果不能覆盖新状态。
+  const loadSnapshot = useCallback((options: { interactive?: boolean } = {}) => {
+    const interactive = options.interactive === true;
+    if (interactive) setRefreshing(true);
+
+    const activeRequest = snapshotRequestRef.current;
+    if (activeRequest) {
+      return interactive
+        ? activeRequest.promise.finally(() => {
+          if (componentActiveRef.current) setRefreshing(false);
+        })
+        : activeRequest.promise;
     }
+
+    const id = ++snapshotRequestIdRef.current;
+    const controller = new AbortController();
+    const promise = (async () => {
+      try {
+        const next = await fetchJson<Snapshot>(
+          `${apiBaseUrl}/api/snapshot${interactive ? "?fresh=1" : ""}`,
+          { signal: controller.signal },
+          { timeoutMs: snapshotRequestTimeoutMs, label: "Snapshot refresh" }
+        );
+        if (controller.signal.aborted || snapshotRequestRef.current?.id !== id) return;
+
+        snapshotAvailableRef.current = true;
+        setSnapshot(next);
+        setError("");
+        setLastUpdatedAt(Date.now());
+        setChartNow(Date.now());
+        const trafficSample = createTrafficSample(next.networkSnapshot);
+        const resourceSample = createResourceSample(next.runtimeResources);
+        // 趋势和事件是非阻塞派生视图；状态卡先更新，图表历史稍后完成同批提交。
+        startTransition(() => {
+          if (trafficSample) {
+            setTrafficHistory((current) => appendTrafficSample(current, trafficSample));
+          }
+          if (resourceSample) {
+            setResourceHistory((current) => appendResourceSample(current, resourceSample));
+          }
+          setProbeHistory((current) => mergeProbeHistory(current, next.latencySeries, {
+            now: next.generatedAt,
+            maxPoints: PROBE_HISTORY_LIMIT
+          }));
+          setEvents((current) => mergeEventHistory(current, next.events, {
+            now: next.generatedAt,
+            maxPoints: EVENT_HISTORY_LIMIT
+          }));
+        });
+      } catch (caught) {
+        if (!isAbortError(caught) && snapshotRequestRef.current?.id === id) {
+          setError(caught instanceof Error ? caught.message : String(caught));
+        }
+      } finally {
+        if (snapshotRequestRef.current?.id === id) {
+          snapshotRequestRef.current = null;
+          snapshotFinishedAtRef.current = Date.now();
+          if (componentActiveRef.current) setLoading(false);
+        }
+      }
+    })();
+    snapshotRequestRef.current = { id, controller, promise };
+
+    return interactive
+      ? promise.finally(() => {
+        if (componentActiveRef.current) setRefreshing(false);
+      })
+      : promise;
   }, []);
 
-  // 10 秒轮询与服务端流量分析周期对齐，前端历史明确只覆盖当前页面会话。
+  // 组件卸载时终止全部浏览器请求；id 守卫阻止 StrictMode 旧 effect 回写新挂载。
   useEffect(() => {
-    loadSnapshot();
-    const timer = window.setInterval(loadSnapshot, 10000);
-    return () => window.clearInterval(timer);
+    componentActiveRef.current = true;
+    return () => {
+      componentActiveRef.current = false;
+      const snapshotRequest = snapshotRequestRef.current;
+      snapshotRequest?.controller.abort();
+      if (snapshotRequestRef.current?.id === snapshotRequest?.id) snapshotRequestRef.current = null;
+      analysisAbortRef.current?.abort();
+      analysisAbortRef.current = null;
+      pingAbortRef.current?.abort();
+      pingAbortRef.current = null;
+    };
+  }, []);
+
+  // 请求完成后再等待 10 秒；隐藏或离线时暂停，回到前台后立即恢复一次采集。
+  useEffect(() => {
+    let disposed = false;
+    let timer: number | null = null;
+
+    const clearTimer = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const canPoll = () => document.visibilityState === "visible" && navigator.onLine !== false;
+    const schedule = () => {
+      clearTimer();
+      if (disposed || !canPoll()) return;
+      timer = window.setTimeout(runPoll, snapshotRefreshIntervalMs);
+    };
+    const runPoll = () => {
+      if (disposed || !canPoll()) return;
+      const elapsed = Date.now() - snapshotFinishedAtRef.current;
+      if (snapshotFinishedAtRef.current > 0 && elapsed < snapshotRefreshIntervalMs) {
+        clearTimer();
+        timer = window.setTimeout(runPoll, snapshotRefreshIntervalMs - elapsed);
+        return;
+      }
+      void loadSnapshot().finally(schedule);
+    };
+    const resume = () => {
+      clearTimer();
+      if (!canPoll()) {
+        const activeRequest = snapshotRequestRef.current;
+        activeRequest?.controller.abort();
+        if (snapshotRequestRef.current?.id === activeRequest?.id) snapshotRequestRef.current = null;
+        // 隐藏页保留首屏骨架；可见但离线时结束等待，避免页面看起来永久卡在加载中。
+        if (navigator.onLine === false && componentActiveRef.current) setLoading(false);
+        return;
+      }
+      // 离线恢复且尚无任何快照时重新进入首屏等待态；已有旧数据则持续显示旧数据。
+      if (!snapshotAvailableRef.current && componentActiveRef.current) setLoading(true);
+      void loadSnapshot().finally(schedule);
+    };
+
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("online", resume);
+    window.addEventListener("offline", resume);
+    resume();
+
+    return () => {
+      disposed = true;
+      clearTimer();
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("online", resume);
+      window.removeEventListener("offline", resume);
+      const activeRequest = snapshotRequestRef.current;
+      activeRequest?.controller.abort();
+      if (snapshotRequestRef.current?.id === activeRequest?.id) snapshotRequestRef.current = null;
+    };
   }, [loadSnapshot]);
 
   // WebSocket 增量与 snapshot 种子在浏览器合并后统一聚合，避免类型构成和趋势口径分裂。
@@ -752,6 +1084,17 @@ function App() {
       eventStats: buildEventStats(events, { now: chartNow, maxEvents: EVENT_HISTORY_LIMIT })
     };
   }, [chartNow, events, snapshot]);
+
+  // 手动 Ping 先用 POST 响应即时展示，再与后续 snapshot 的默认探测去重合并。
+  const displayedPings = useMemo(() => {
+    const unique = new Map<string, PingResult>();
+    for (const item of [...(mergedSnapshot?.pings ?? []), ...manualPingResults]) {
+      unique.set(`${item.target}\u0000${item.timestamp}`, item);
+    }
+    return Array.from(unique.values())
+      .sort((left, right) => right.timestamp - left.timestamp)
+      .slice(0, manualPingResultLimit);
+  }, [manualPingResults, mergedSnapshot?.pings]);
 
   const visibleTrafficHistory = useMemo(
     () => trimChartWindow(trafficHistory, { now: chartNow, maxPoints: CHART_SAMPLE_LIMIT }),
@@ -868,17 +1211,29 @@ function App() {
   }
 
   async function runAnalysis() {
+    if (aiLoading) return;
+    const controller = new AbortController();
+    analysisAbortRef.current?.abort();
+    analysisAbortRef.current = controller;
     setAiLoading(true);
     setAiError("");
     try {
-      const response = await fetch(`${apiBaseUrl}/api/analyze`, { method: "POST" });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "AI analysis failed");
+      const payload = await fetchJson<{ analysis: string }>(
+        `${apiBaseUrl}/api/analyze`,
+        { method: "POST", signal: controller.signal },
+        { timeoutMs: analysisRequestTimeoutMs, label: "AI analysis" }
+      );
+      if (controller.signal.aborted || analysisAbortRef.current !== controller) return;
       setAnalysis(payload.analysis);
     } catch (caught) {
-      setAiError(caught instanceof Error ? caught.message : String(caught));
+      if (!isAbortError(caught) && analysisAbortRef.current === controller) {
+        setAiError(caught instanceof Error ? caught.message : String(caught));
+      }
     } finally {
-      setAiLoading(false);
+      if (analysisAbortRef.current === controller) {
+        analysisAbortRef.current = null;
+        if (componentActiveRef.current) setAiLoading(false);
+      }
     }
   }
 
@@ -886,21 +1241,53 @@ function App() {
     event.preventDefault();
     const hostname = pingHost.trim();
     if (!hostname || pingLoading) return;
+    const controller = new AbortController();
+    pingAbortRef.current?.abort();
+    pingAbortRef.current = controller;
     setPingLoading(true);
     setPingError("");
     try {
-      const response = await fetch(`${apiBaseUrl}/api/ping`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ hostname })
+      const payload = await fetchJson<PingResult>(
+        `${apiBaseUrl}/api/ping`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ hostname }),
+          signal: controller.signal
+        },
+        { timeoutMs: pingRequestTimeoutMs, label: "Ping probe" }
+      );
+      if (controller.signal.aborted || pingAbortRef.current !== controller) return;
+
+      setManualPingResults((current) => {
+        const unique = new Map(
+          [payload, ...current].map((item) => [`${item.target}\u0000${item.timestamp}`, item])
+        );
+        return Array.from(unique.values()).slice(0, manualPingResultLimit);
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Ping probe failed");
-      await loadSnapshot();
+      startTransition(() => {
+        setProbeHistory((current) => mergeProbeHistory(current, [{
+          target: payload.target,
+          timestamp: payload.timestamp,
+          time: formatTime(payload.timestamp),
+          latencyMs: payload.latencyMs,
+          success: payload.success
+        }], {
+          now: payload.timestamp,
+          maxPoints: PROBE_HISTORY_LIMIT
+        }));
+      });
+      // POST 结果已经可见；完整 snapshot 只在后台同步其余状态，不再阻塞按钮反馈。
+      void loadSnapshot();
     } catch (caught) {
-      setPingError(caught instanceof Error ? caught.message : String(caught));
+      if (!isAbortError(caught) && pingAbortRef.current === controller) {
+        setPingError(caught instanceof Error ? caught.message : String(caught));
+      }
     } finally {
-      setPingLoading(false);
+      if (pingAbortRef.current === controller) {
+        pingAbortRef.current = null;
+        if (componentActiveRef.current) setPingLoading(false);
+      }
     }
   }
 
@@ -949,6 +1336,18 @@ function App() {
         : expandedChart === "events"
           ? expandedEventTimeline
           : [];
+  const eventStatusValue = eventStream.connected
+    ? "live"
+    : eventStream.phase === "recovering"
+      ? "recovering"
+      : eventStream.phase === "reconnecting"
+        ? "reconnecting"
+        : eventStream.phase;
+  const eventStatusTone = eventStream.connected
+    ? "ok" as const
+    : eventStream.phase === "connecting" || eventStream.phase === "recovering" || eventStream.phase === "reconnecting"
+      ? "warn" as const
+      : "muted" as const;
 
   return (
     <main className="app-shell">
@@ -963,7 +1362,7 @@ function App() {
         <div className="header-controls">
           <div className="status-cluster" aria-live="polite">
             <StatusPill ok={Boolean(mergedSnapshot?.grpc.ok)} label="gRPC" value={mergedSnapshot?.grpc.ok ? "online" : "offline"} />
-            <StatusPill ok={eventStream.connected} label="Events" value={eventStream.connected ? "live" : "offline"} />
+            <StatusPill ok={eventStream.connected} tone={eventStatusTone} label="Events" value={eventStatusValue} />
             <StatusPill ok={browserRequestState.tone === "ok"} tone={browserRequestState.tone} label="Browser" value={browserRequestState.value} />
             <StatusPill ok={Boolean(mergedSnapshot?.ai.configured)} label="AI" value={mergedSnapshot?.ai.configured ? "ready" : "not configured"} />
             <StatusPill ok={Boolean(observation?.valid)} label="Capture" value={observation?.valid ? "trusted" : observation?.baselineOnly ? "warming" : "degraded"} />
@@ -983,7 +1382,9 @@ function App() {
             </button>
             <button
               className="icon-button"
-              onClick={loadSnapshot}
+              onClick={() => void loadSnapshot({ interactive: true })}
+              disabled={refreshing}
+              aria-busy={refreshing}
               aria-label="Refresh network snapshot"
               title="Refresh network snapshot"
               type="button"
@@ -1081,7 +1482,7 @@ function App() {
                     />
                     {/* 桌面双栏时随右侧事实列表拉伸，充分利用该网格行原本空出的纵向空间。 */}
                     <div className="traffic-chart-canvas" id="traffic-chart">
-                      <TrafficTrendChart
+                      <MemoTrafficTrendChart
                         data={visibleTrafficHistory}
                         showThroughput={showTrafficThroughput}
                         showPackets={showTrafficPackets}
@@ -1288,7 +1689,7 @@ function App() {
                   action={<ChartExpandButton label="CPU utilization" onClick={() => openExpandedChart("cpu")} />}
                 />
                 <div className="resource-chart-canvas" id="resource-cpu-chart">
-                  <CpuTrendChart data={visibleResourceHistory} showEngine={showEngineCpu} showDashboard={showDashboardCpu} />
+                  <MemoCpuTrendChart data={visibleResourceHistory} showEngine={showEngineCpu} showDashboard={showDashboardCpu} />
                 </div>
                 <p className="chart-note">Up to 5 hours of instantaneous process CPU; missing samples remain gaps.</p>
               </article>
@@ -1309,14 +1710,14 @@ function App() {
                   action={<ChartExpandButton label="resident memory" onClick={() => openExpandedChart("memory")} />}
                 />
                 <div className="resource-chart-canvas" id="resource-memory-chart">
-                  <MemoryTrendChart data={visibleResourceHistory} showEngine={showEngineMemory} showDashboard={showDashboardMemory} />
+                  <MemoMemoryTrendChart data={visibleResourceHistory} showEngine={showEngineMemory} showDashboard={showDashboardMemory} />
                 </div>
                 <p className="chart-note">Up to 5 hours of current RSS, not cumulative allocation or virtual address space.</p>
               </article>
             </div>
           </section>
 
-          <RequestFailurePanel snapshot={requestFailures} />
+          <MemoRequestFailurePanel snapshot={requestFailures} />
 
           <section className="evidence-grid" id="diagnostic-evidence">
             <article className="panel chart-panel">
@@ -1336,7 +1737,7 @@ function App() {
                 action={<ChartExpandButton label="probe rhythm" onClick={() => openExpandedChart("probe")} />}
               />
               <div className="probe-chart-canvas" id="probe-rhythm-chart">
-                <ProbeTrendChart rhythm={probeRhythm} selectedTargets={selectedProbeTargets} colorByTarget={probeColorByTarget} />
+                <MemoProbeTrendChart rhythm={probeRhythm} selectedTargets={selectedProbeTargets} colorByTarget={probeColorByTarget} />
               </div>
               <p className="chart-note">Up to 5 hours per browser session. Failed probes stay in the counters and are never converted to 0 ms or connected to another target.</p>
             </article>
@@ -1354,7 +1755,7 @@ function App() {
                     <ChartExpandButton label="events per minute" onClick={() => openExpandedChart("events")} />
                   </div>
                   <div className="event-cadence-canvas">
-                    <EventCadenceChart data={visibleEventTimeline} gradientId="event-gradient-inline" />
+                    <MemoEventCadenceChart data={visibleEventTimeline} gradientId="event-gradient-inline" />
                   </div>
                 </div>
               </div>
@@ -1373,7 +1774,7 @@ function App() {
               </form>
               {pingError && <div className="notice error compact" role="alert">{pingError}</div>}
               <div className="probe-results">
-                {mergedSnapshot.pings.map((item) => (
+                {displayedPings.map((item) => (
                   <article className={item.success ? "probe-result success" : "probe-result failed"} key={`${item.target}-${item.timestamp}`}>
                     <div><strong>{item.target}</strong><StatusTag tone={item.success ? "good" : "danger"}>{item.success ? "Success" : "Failed"}</StatusTag></div>
                     <p>{item.success ? formatMilliseconds(item.latencyMs) : item.error || item.result}</p>
@@ -1438,7 +1839,7 @@ function App() {
                     onToggle={toggleTrafficSeries}
                   />
                   <div className="chart-analysis-canvas" id="expanded-traffic-chart">
-                    <TrafficTrendChart
+                    <MemoTrafficTrendChart
                       data={expandedTrafficHistory}
                       showThroughput={showTrafficThroughput}
                       showPackets={showTrafficPackets}
@@ -1459,7 +1860,7 @@ function App() {
                     onToggle={toggleCpuSeries}
                   />
                   <div className="chart-analysis-canvas" id="expanded-cpu-chart">
-                    <CpuTrendChart data={expandedResourceHistory} showEngine={showEngineCpu} showDashboard={showDashboardCpu} expanded />
+                    <MemoCpuTrendChart data={expandedResourceHistory} showEngine={showEngineCpu} showDashboard={showDashboardCpu} expanded />
                   </div>
                 </>
               )}
@@ -1473,7 +1874,7 @@ function App() {
                     onToggle={toggleMemorySeries}
                   />
                   <div className="chart-analysis-canvas" id="expanded-memory-chart">
-                    <MemoryTrendChart data={expandedResourceHistory} showEngine={showEngineMemory} showDashboard={showDashboardMemory} expanded />
+                    <MemoMemoryTrendChart data={expandedResourceHistory} showEngine={showEngineMemory} showDashboard={showDashboardMemory} expanded />
                   </div>
                 </>
               )}
@@ -1493,13 +1894,13 @@ function App() {
                     onToggle={toggleProbeTarget}
                   />
                   <div className="chart-analysis-canvas" id="expanded-probe-chart">
-                    <ProbeTrendChart rhythm={expandedProbeRhythm} selectedTargets={selectedProbeTargets} colorByTarget={probeColorByTarget} expanded />
+                    <MemoProbeTrendChart rhythm={expandedProbeRhythm} selectedTargets={selectedProbeTargets} colorByTarget={probeColorByTarget} expanded />
                   </div>
                 </>
               )}
               {expandedChart === "events" && (
                 <div className="chart-analysis-canvas chart-analysis-canvas-single" id="expanded-events-chart">
-                  <EventCadenceChart data={expandedEventTimeline} gradientId="event-gradient-expanded" expanded />
+                  <MemoEventCadenceChart data={expandedEventTimeline} gradientId="event-gradient-expanded" expanded />
                 </div>
               )}
             </ChartAnalysisDialog>
@@ -1694,6 +2095,8 @@ function RequestFailurePanel({ snapshot }: { snapshot: RequestFailureSnapshot | 
     </section>
   );
 }
+
+const MemoRequestFailurePanel = memo(RequestFailurePanel);
 
 function RequestAlertRow({ alert }: { alert: RequestFailureAlert }) {
   return (

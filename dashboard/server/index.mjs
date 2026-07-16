@@ -29,6 +29,7 @@ import {
 import {
   admitWebSocketConnection,
   boundedInteger,
+  createCachedSingleFlight,
   createConcurrencyGate,
   createRetiringResourceTracker,
   sendWebSocketMessage
@@ -128,6 +129,11 @@ const wsMaxBufferedBytes = boundedInteger(
   process.env.DASHBOARD_WS_MAX_BUFFERED_BYTES,
   256 * 1024,
   { min: 16 * 1024, max: 16 * 1024 * 1024 }
+);
+const snapshotCacheTtlMs = boundedInteger(
+  process.env.DASHBOARD_SNAPSHOT_CACHE_TTL_MS,
+  2000,
+  { min: 0, max: 10_000 }
 );
 const requestFailureWindowSeconds = boundedInteger(
   process.env.DASHBOARD_REQUEST_FAILURE_WINDOW_SEC,
@@ -246,6 +252,11 @@ const requestFailureMonitor = createRequestFailureMonitor({
   windowMs: requestFailureWindowSeconds * 1000,
   threshold: requestFailureThreshold,
   maxRecent: requestFailureMaxRecent
+});
+// 多标签页和手动操作可能同刻请求快照；共享底层采集，并只短暂复用成功结果。
+const snapshotLoader = createCachedSingleFlight(collectSnapshot, {
+  ttlMs: snapshotCacheTtlMs,
+  clock: now
 });
 
 // 扩展上报与 Dashboard 页面使用不同 Origin 策略；两条链都先鉴权，再解析 JSON/执行采样。
@@ -648,6 +659,22 @@ function broadcast(payload) {
   }
 }
 
+// 上游 gRPC stream 状态只在真实变化时广播，避免重复消息触发无意义的整页更新。
+function transitionEventStream(connected, error = "") {
+  const nextConnected = Boolean(connected);
+  const nextError = String(error || "");
+  if (streamConnected === nextConnected && streamError === nextError) return;
+  streamConnected = nextConnected;
+  streamError = nextError;
+  broadcast({ type: "stream", connected: streamConnected, error: streamError });
+}
+
+function clearEventReconnect() {
+  if (!reconnectTimer) return;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+}
+
 // 合并并发断流通知，确保五秒窗口内只安排一次重连。
 function scheduleEventReconnect() {
   if (shuttingDown || reconnectTimer) {
@@ -666,8 +693,7 @@ async function connectEventStream() {
     return;
   }
   streamStartedAt = now();
-  streamConnected = false;
-  streamError = "";
+  transitionEventStream(false, "");
   await selectReachableGrpcAddress();
   // shutdown 可能发生在地址探测期间，返回后再次检查，避免退出过程中创建新 stream。
   if (shuttingDown) {
@@ -682,35 +708,44 @@ async function connectEventStream() {
     }
     call = client.subscribeEvents({ types: [] });
     streamCall = call;
+    // call 已成功接管生命周期；即使当前没有事件/initial metadata，也不能让旧 call
+    // 遗留的 timer 五秒后取消这条安静但有效的新订阅。新 call 若 error/end 会重新调度。
+    clearEventReconnect();
   } catch (error) {
     // streaming 创建可能同步抛错，此时记录原因并进入统一重连节奏。
-    streamError = compactError(error);
+    transitionEventStream(false, compactError(error));
     scheduleEventReconnect();
     return;
   }
 
   let closed = false;
+  const markConnected = () => {
+    if (closed || streamCall !== call) return;
+    // 地址切换时旧 call 可能在新 call 赋值前留下重连 timer；新流一旦有
+    // metadata/data 强证据就取消它，避免五秒后误杀已经健康的连接。
+    clearEventReconnect();
+    transitionEventStream(true, "");
+  };
   // 统一处理 error/end，更新连接状态并安排下一次重连。
   const closeOnce = (error = null) => {
     if (closed) {
       return;
     }
     closed = true;
+    // 已有更新的 stream 接管时，迟到的旧 call close 不能覆盖新连接状态。
+    if (streamCall && streamCall !== call) return;
     if (streamCall === call) {
       streamCall = null;
     }
-    streamConnected = false;
-    if (error) {
-      streamError = compactError(error);
-    }
-    broadcast({ type: "stream", connected: false, error: streamError });
+    transitionEventStream(false, error ? compactError(error) : streamError);
     scheduleEventReconnect();
   };
 
+  // metadata 是无业务事件时的首选连接证据；data 继续作为兼容旧服务端的恢复兜底。
+  call.on("metadata", markConnected);
   // 每条 proto 事件先规范化和入缓存，再广播给 WebSocket 客户端。
   call.on("data", (event) => {
-    streamConnected = true;
-    streamError = "";
+    markConnected();
     const normalized = normalizeEvent(event);
     rememberEvent(normalized);
     broadcast({ type: "event", event: normalized });
@@ -804,7 +839,12 @@ async function collectSnapshot() {
   const generatedAt = now();
   refreshAiConfig();
   await selectReachableGrpcAddress();
-  const [networkSnapshotResult] = await Promise.allSettled([rpc("getNetworkSnapshot", {}, 5000)]);
+  // typed snapshot 与默认 Ping 彼此独立，并行执行可把最坏等待从两段 deadline 之和
+  // 收敛为较慢的一段；各 Ping 内部仍保留独立失败结果，不影响其余目标。
+  const [networkSnapshotResult, pings] = await Promise.all([
+    Promise.allSettled([rpc("getNetworkSnapshot", {}, 5000)]).then(([result]) => result),
+    Promise.all(pingTargets.map((target) => pingTarget(target)))
+  ]);
 
   const errors = [];
   let networkSnapshot = null;
@@ -819,7 +859,6 @@ async function collectSnapshot() {
     errors.push(compactError(networkSnapshotResult.reason));
   }
 
-  const pings = await Promise.all(pingTargets.map((target) => pingTarget(target)));
   const recentEvents = trimChartWindow(eventBuffer, {
     now: generatedAt,
     maxPoints: maxEvents
@@ -1002,6 +1041,10 @@ app.get("/api/status", (_request, response) => {
       maxConnections: wsMaxConnections,
       maxBufferedBytes: wsMaxBufferedBytes
     },
+    snapshotCache: {
+      ttlMs: snapshotCacheTtlMs,
+      inFlight: snapshotLoader.inFlight
+    },
     browserRequestFailures: {
       connectedRecent: requestFailures.connectedRecent,
       lastHeartbeatAt: requestFailures.lastHeartbeatAt,
@@ -1020,6 +1063,7 @@ app.get("/api/status", (_request, response) => {
 function ingestBrowserFailures(request, response) {
   try {
     const result = requestFailureMonitor.ingest(request.body, { receivedAt: now() });
+    snapshotLoader.invalidate();
     response.status(202).json(result);
   } catch (error) {
     response.status(error?.statusCode || 400).json({ error: compactError(error) });
@@ -1027,9 +1071,11 @@ function ingestBrowserFailures(request, response) {
 }
 
 // 即时采集并返回一次完整 snapshot。
-app.get("/api/snapshot", async (_request, response) => {
+app.get("/api/snapshot", async (request, response) => {
   try {
-    response.json(await collectSnapshot());
+    // 用户点击 Refresh 时绕过刚完成的短缓存；仍会与正在执行的采集合并。
+    const force = request.query?.fresh === "1";
+    response.json(await snapshotLoader.load({ force }));
   } catch (error) {
     // snapshot 采集异常统一收敛为 HTTP 500 JSON。
     response.status(500).json({ error: compactError(error) });
@@ -1044,7 +1090,9 @@ app.post("/api/ping", async (request, response) => {
     return;
   }
 
-  response.json(await pingTarget(hostname));
+  const result = await pingTarget(hostname);
+  snapshotLoader.invalidate();
+  response.json(result);
 });
 
 // 重新采集最新证据后发起 AI 诊断，避免使用前端可篡改的 snapshot。
@@ -1060,7 +1108,8 @@ app.post("/api/analyze", async (request, response) => {
   }
 
   try {
-    const snapshot = await collectSnapshot();
+    // AI 始终绕过已完成的短缓存，但会复用此刻已经进行中的同一轮采集。
+    const snapshot = await snapshotLoader.load({ force: true });
     const diagnosisConfig = {
       topK: request.body?.top_k ?? request.body?.topK ?? process.env.RAG_TOP_K ?? 4,
       similarityThreshold:
@@ -1110,10 +1159,7 @@ function shutdown(signal) {
   shuttingDown = true;
   console.log(`WeakNet dashboard received ${signal}, shutting down...`);
 
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
+  clearEventReconnect();
   if (streamCall) {
     const activeStream = streamCall;
     streamCall = null;
