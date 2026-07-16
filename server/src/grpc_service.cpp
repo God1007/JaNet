@@ -431,10 +431,11 @@ public:
             item->set_rtt_availability(metricAvailability(isRttAvailable(net.rttMs())));
             item->set_link_quality(toProtoLinkQuality(net.quality()));
             item->set_rssi_dbm(net.rssiDbm());
-            item->set_rssi_availability(metricAvailability(net.rssiDbm() > -1000));
+            item->set_rssi_availability(metricAvailability(isRssiAvailable(net.rssiDbm())));
             item->set_tcp_retransmission_rate_percent(net.tcpLossRate());
             item->set_tcp_retransmission_level(net.tcpLossLevel());
-            item->set_tcp_retransmission_availability(metricAvailability(net.tcpLossRate() >= 0.0));
+            item->set_tcp_retransmission_availability(
+                metricAvailability(isTcpRetransmissionAvailable(net.tcpLossRate())));
             const uint32_t interfaceIndex = if_nametoindex(net.ifName().c_str());
             const bool trafficBoundToInterface = trafficStats.boundIfindex != 0
                 && interfaceIndex == trafficStats.boundIfindex;
@@ -486,10 +487,10 @@ public:
             if (!isRttAvailable(assessedInterface->rttMs())) {
                 qualitySummary->add_missing_metrics("rtt_ms");
             }
-            if (assessedInterface->rssiDbm() <= -1000) {
+            if (!isRssiAvailable(assessedInterface->rssiDbm())) {
                 qualitySummary->add_missing_metrics("rssi_dbm");
             }
-            if (assessedInterface->tcpLossRate() < 0.0) {
+            if (!isTcpRetransmissionAvailable(assessedInterface->tcpLossRate())) {
                 qualitySummary->add_missing_metrics("tcp_retransmission_rate_percent");
             }
             const uint32_t assessedIfindex = if_nametoindex(assessedInterface->ifName().c_str());

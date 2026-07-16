@@ -67,6 +67,7 @@ SERVER_CONTEXT_LIFECYCLE_TEST=$(BUILD_DIR)/server_context_lifecycle_test
 PROCESS_RESOURCE_SAMPLER_TEST=$(BUILD_DIR)/process_resource_sampler_test
 TRAFFIC_OBSERVATION_STATE_TEST=$(BUILD_DIR)/traffic_observation_state_test
 RTT_PRECISION_TEST=$(BUILD_DIR)/rtt_precision_test
+NETWORK_QUALITY_ASSESSOR_TEST=$(BUILD_DIR)/network_quality_assessor_test
 RTT_PROTO_ROUNDTRIP_TEST=$(BUILD_DIR)/rtt_proto_roundtrip_test
 RTT_PROTO_GEN_DIR=$(BUILD_DIR)/rtt-proto-generated
 RTT_PROTO_TEST_CC=$(RTT_PROTO_GEN_DIR)/weaknet.pb.cc
@@ -115,10 +116,15 @@ $(TARGET): $(SRC) $(INC) $(PROTO_SRCS) $(PROTO_HDRS) $(BPF_TARGET)
 	$(CC) $(CXXFLAGS) $(INCLUDES) -o $@ $(SRC) $(PROTO_SRCS) $(LDFLAGS)
 
 # clean 与 run 是命令目标，不依赖同名文件是否存在。
-.PHONY: clean run test-rtt test-traffic-core test-process-resources check-bpf-syntax check-bpf-object check-traffic-userspace test-traffic-linux test-traffic-kernel test-tc-ownership benchmark benchmark-smoke benchmark-standard benchmark-stress benchmark-traffic-core benchmark-core-tsan benchmark-bpf-maps benchmark-kernel-pressure benchmark-event-driver benchmark-help
+.PHONY: clean run test-rtt test-quality test-traffic-core test-process-resources check-bpf-syntax check-bpf-object check-traffic-userspace test-traffic-linux test-traffic-kernel test-tc-ownership benchmark benchmark-smoke benchmark-standard benchmark-stress benchmark-traffic-core benchmark-core-tsan benchmark-bpf-maps benchmark-kernel-pressure benchmark-event-driver benchmark-help
+
+# 不访问真实网络，验证综合评分的连续锚点、权重、缺失哨兵和 JSON 解释字段。
+test-quality: dirs
+	$(CC) $(CXXFLAGS) $(GLOG_CFLAGS) -Iinclude tests/network_quality_assessor_test.cpp src/network_quality_assessor.cpp -o $(NETWORK_QUALITY_ASSESSOR_TEST) $(if $(GLOG_LIBS),$(GLOG_LIBS),-lglog)
+	$(NETWORK_QUALITY_ASSESSOR_TEST)
 
 # 无网络、无 root 的 RTT 回归：分别锁定领域模型/质量评分与 protobuf 二进制契约。
-test-rtt: dirs
+test-rtt: dirs test-quality
 	$(CC) $(CXXFLAGS) $(GLOG_CFLAGS) -Iinclude tests/rtt_precision_test.cpp src/network_quality_assessor.cpp -o $(RTT_PRECISION_TEST) $(if $(GLOG_LIBS),$(GLOG_LIBS),-lglog)
 	$(RTT_PRECISION_TEST)
 	@mkdir -p $(RTT_PROTO_GEN_DIR)

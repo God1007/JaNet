@@ -383,7 +383,18 @@ flowchart LR
 
 ## 7. 综合质量归纳
 
-`NetworkQualityAssessor` 从当前活动接口读取 RTT、TCP 重传率代理值、RSSI 和流量特征，生成等级、0 到 100 的分数及 `issues` 列表。
+`NetworkQualityAssessor` 从当前活动接口读取 RTT、TCP 重传率代理值、RSSI 和流量特征，生成等级、0 到 100 的分数及 `issues` 列表。各子分采用保留业务阈值锚点的分段线性映射，而不是阈值命中后直接返回整档分数：RTT 的 50/100/200ms、TCP 代理值的 0.1/0.5/2% 和 RSSI 的 -50/-60/-70dBm 仍保留原有含义，但区间内会连续变化。
+
+| 子分 | 线性锚点 | 边界处理 |
+| --- | --- | --- |
+| RTT | 50ms→100，100ms→80，200ms→60，280ms→20 | 50ms 内封顶 100，280ms 后封底 20 |
+| TCP 重传代理 | 0.1%→100，0.5%→80，2%→60，4.5%→10 | 0.1% 内封顶 100，4.5% 后封底 10 |
+| RSSI | -50dBm→100，-60dBm→80，-70dBm→60，-95dBm→10 | -50dBm 以上封顶 100，-95dBm 以下封底 10 |
+| Traffic | 平均包 200B→0，600B→50，1000B→100 | 用 `min(active_flows / 5, 1)` 将证据平滑拉回中性 50 |
+
+总分仍保持 `RTT×30% + TCP×30% + RSSI×20% + Traffic×20%`，等级边界仍为 90/75/50。这样修复了旧模型在阈值右侧瞬降 20 子分的问题，同时保持权重和等级的历史口径。流量证据围绕 50 分双向变化：充足的负证据会扣分，不会再因“样本更多”反向获得奖励。
+
+兼容 JSON 会输出 `score_model=piecewise_linear_v2` 和四项 `metric_scores`，用于解释总分。缺失 RTT、TCP 或 RSSI 使用中性未知分，不会再把 RSSI 的 `-1000` 哨兵误判为极差信号；typed Snapshot 仍通过 `degraded` 与 `missing_metrics` 提醒调用方观测不完整。
 
 ```mermaid
 flowchart LR

@@ -4,6 +4,7 @@
 #ifndef NETWORK_QUALITY_ASSESSOR_HPP
 #define NETWORK_QUALITY_ASSESSOR_HPP
 
+#include <cmath>
 #include <string>
 #include <map>
 #include <vector>
@@ -20,12 +21,22 @@ enum class NetworkQualityLevel {
     UNKNOWN = 0     // 未知
 };
 
+// TCP 代理指标的统一可用性判定，供评分器和 gRPC typed Snapshot 共用。
+inline bool isTcpRetransmissionAvailable(double ratePercent) {
+    return std::isfinite(ratePercent) && ratePercent >= 0.0;
+}
+
+// NetInfo 以 -1000 表示未采样，0 是旧实现使用过的兼容哨兵。
+inline bool isRssiAvailable(int rssiDbm) {
+    return rssiDbm > -1000 && rssiDbm != 0;
+}
+
 // 一次质量评估的完整值结果。
 struct NetworkQualityResult {
-    NetworkQualityLevel level;       // 归纳后的质量等级
+    NetworkQualityLevel level = NetworkQualityLevel::UNKNOWN; // 归纳后的质量等级
     std::string levelName;           // 等级的稳定可读名称
     std::string details;             // 指标详情，当前实现为 JSON 文本
-    double score;                    // 综合分数，范围 0-100
+    double score = 0.0;              // 综合分数，范围 0-100
     std::vector<std::string> issues; // 识别到的问题描述列表
 };
 
@@ -84,16 +95,16 @@ public:
     void updateThresholds(const QualityThresholds& newThresholds);
     
 private:
-    // 将 RTT 毫秒值映射为 0-100 分。
+    // 按 50/100/200ms 业务锚点将 RTT 连续映射为 0-100 分。
     double calculateRttScore(double rttMs);
     
-    // 将 TCP 重传百分比代理值映射为 0-100 分。
+    // 按 0.1/0.5/2% 业务锚点将 TCP 重传代理值连续映射为 0-100 分。
     double calculateTcpLossScore(double lossRate);
     
-    // 将 RSSI dBm 值映射为 0-100 分。
+    // 按 -50/-60/-70dBm 业务锚点将 RSSI 连续映射为 0-100 分。
     double calculateRssiScore(int rssiDbm);
     
-    // 根据接口的活跃流和平均包大小计算 0-100 流量分。
+    // 根据接口的活跃流置信度和平均包大小连续计算 0-100 流量分。
     double calculateTrafficScore(const NetInfo& interface);
     
     // 根据阈值和综合分生成可读问题列表。

@@ -11,6 +11,44 @@
 
 namespace weaknet_grpc {
 
+namespace {
+
+constexpr double kRttMinimumScore = 20.0;
+constexpr double kTcpMinimumScore = 10.0;
+constexpr double kRssiMinimumScore = 10.0;
+constexpr double kUnavailableMetricScore = 50.0;
+
+// 在两个业务锚点之间做有界线性插值；区间外夹紧到端点，避免异常值把总分推出 0..100。
+double interpolateScore(double value,
+                        double leftValue,
+                        double leftScore,
+                        double rightValue,
+                        double rightScore) {
+    if (!std::isfinite(value) || !std::isfinite(leftValue) || !std::isfinite(rightValue)
+        || rightValue <= leftValue) {
+        return leftScore;
+    }
+    const double ratio = std::clamp(
+        (value - leftValue) / (rightValue - leftValue), 0.0, 1.0);
+    return leftScore + (rightScore - leftScore) * ratio;
+}
+
+bool isTrafficMetricAvailable(const NetInfo& interface) {
+    // 0 flow 既可能是真实空闲，也可能是采集链路暂无样本；两种情况都不能证明网络好坏。
+    return interface.trafficActiveFlows() > 0
+        && interface.trafficTotalBps() > 0
+        && interface.trafficTotalPps() > 0;
+}
+
+NetworkQualityLevel levelForScore(double score) {
+    if (score >= 90.0) return NetworkQualityLevel::EXCELLENT;
+    if (score >= 75.0) return NetworkQualityLevel::GOOD;
+    if (score >= 50.0) return NetworkQualityLevel::FAIR;
+    return NetworkQualityLevel::POOR;
+}
+
+}  // namespace
+
 // 初始化变化检测基线，首次有效评估会与 UNKNOWN 状态比较。
 NetworkQualityAssessor::NetworkQualityAssessor()
     : qualityChangeCounter_(0) {
@@ -51,25 +89,18 @@ NetworkQualityResult NetworkQualityAssessor::assessQuality(const std::vector<Net
 NetworkQualityResult NetworkQualityAssessor::assessInterfaceQuality(const NetInfo& interface) {
     NetworkQualityResult result;
 
-    // 计算各项网络指标得分
-    double rttScore = calculateRttScore(interface.rttMs());
-    double tcpLossScore = calculateTcpLossScore(interface.tcpLossRate());
-    double rssiScore = calculateRssiScore(interface.rssiDbm());
-    double trafficScore = calculateTrafficScore(interface);
+    // 各项子分都是连续值；缺失项使用中性 50 分，并由 typed Snapshot 标记 degraded。
+    const double rttScore = calculateRttScore(interface.rttMs());
+    const double tcpLossScore = calculateTcpLossScore(interface.tcpLossRate());
+    const double rssiScore = calculateRssiScore(interface.rssiDbm());
+    const double trafficScore = calculateTrafficScore(interface);
 
-    // 使用加权平均计算总分（权重可调整）
-    double totalScore = (rttScore * 0.3 + tcpLossScore * 0.3 + rssiScore * 0.2 + trafficScore * 0.2);
+    // 权重保持 30/30/20/20，避免模型升级同时改变历史业务口径。
+    const double totalScore = rttScore * 0.3 + tcpLossScore * 0.3
+        + rssiScore * 0.2 + trafficScore * 0.2;
 
-    // 根据总分确定网络质量等级
-    if (totalScore >= 90) {
-        result.level = NetworkQualityLevel::EXCELLENT;
-    } else if (totalScore >= 75) {
-        result.level = NetworkQualityLevel::GOOD;
-    } else if (totalScore >= 50) {
-        result.level = NetworkQualityLevel::FAIR;
-    } else {
-        result.level = NetworkQualityLevel::POOR;
-    }
+    // 等级边界保持 90/75/50 不变；只把各指标子分从阶梯改成连续曲线。
+    result.level = levelForScore(totalScore);
 
     result.levelName = getQualityLevelName(result.level);
     result.score = totalScore;
@@ -121,78 +152,82 @@ void NetworkQualityAssessor::updateThresholds(const QualityThresholds& newThresh
     LOG_INFO(LogModule::WEAK_MGR, "网络质量评估阈值已更新");
 }
 
-// 按 RTT 分段评分，超过 fair 阈值后线性扣分并设置最低分。
+// RTT 使用保留原有业务锚点的分段线性映射，消除阈值右侧瞬间跳 20 分的问题。
 double NetworkQualityAssessor::calculateRttScore(double rttMs) {
     // 0ms 和亚毫秒 RTT 都是有效且优秀的测量；只有负值/非有限值代表不可用。
-    if (!isRttAvailable(rttMs)) return 50.0;
+    if (!isRttAvailable(rttMs)) return kUnavailableMetricScore;
 
     if (rttMs <= thresholds_.rtt_excellent) return 100.0;
-    if (rttMs <= thresholds_.rtt_good) return 80.0;
-    if (rttMs <= thresholds_.rtt_fair) return 60.0;
-
-    // 超过 fair 阈值后按比例递减
-    double excess = rttMs - thresholds_.rtt_fair;
-    double penalty = std::min(excess * 0.5, 40.0);  // 最多扣 40 分
-    return std::max(20.0, 60.0 - penalty);
-}
-
-// 按 TCP 重传率分段评分，负值代表当前没有有效样本。
-double NetworkQualityAssessor::calculateTcpLossScore(double lossRate) {
-    if (lossRate < 0) return 50.0;  // 无法获得 TCP 重传代理值时给出中等分数
-
-    if (lossRate <= thresholds_.tcp_loss_excellent) return 100.0;
-    if (lossRate <= thresholds_.tcp_loss_good) return 80.0;
-    if (lossRate <= thresholds_.tcp_loss_fair) return 60.0;
-
-    // 超过 fair 阈值后按比例递减
-    double excess = lossRate - thresholds_.tcp_loss_fair;
-    double penalty = std::min(excess * 20.0, 50.0);  // 最多扣 50 分
-    return std::max(10.0, 60.0 - penalty);
-}
-
-// 按 dBm 信号强度分段评分，越接近 0 表示信号越强。
-double NetworkQualityAssessor::calculateRssiScore(int rssiDbm) {
-    if (rssiDbm == 0) return 50.0;  // 无法测量 RSSI 时给出中等分数
-
-    if (rssiDbm >= thresholds_.rssi_excellent) return 100.0;
-    if (rssiDbm >= thresholds_.rssi_good) return 80.0;
-    if (rssiDbm >= thresholds_.rssi_fair) return 60.0;
-
-    // 低于 fair 阈值后按比例递减
-    double deficit = thresholds_.rssi_fair - rssiDbm;
-    double penalty = std::min(deficit * 2.0, 50.0);  // 最多扣 50 分
-    return std::max(10.0, 60.0 - penalty);
-}
-
-// 用平均包大小和活跃流数量估算流量侧质量，并把结果限制在 0 到 100。
-double NetworkQualityAssessor::calculateTrafficScore(const NetInfo& interface) {
-    // 基于流量分析计算网络质量得分
-    double score = 70.0;  // 基础分数
-
-    // 检查流量特征是否异常
-    if (interface.trafficActiveFlows() > 0) {
-        // 存在活跃流量时，根据流量特征评分
-        double bps = interface.trafficTotalBps();
-        double pps = interface.trafficTotalPps();
-
-        if (bps > 0 && pps > 0) {
-            double avgPacketSize = bps / pps;
-            if (avgPacketSize > 1000) {  // 平均包大小大于 1 KB，网络质量较好
-                score += 20.0;
-            } else if (avgPacketSize < 200) {  // 平均包较小，可能存在网络问题
-                score -= 20.0;
-            }
-        }
-
-        // 检查活跃流数量
-        if (static_cast<int>(interface.trafficActiveFlows()) >= thresholds_.min_flows_for_analysis) {
-            score += 10.0;  // 活跃流足够多，样本可用于质量分析
-        }
-    } else {
-        score = 50.0;  // 没有活跃流量时给出中等分数
+    if (rttMs <= thresholds_.rtt_good) {
+        return interpolateScore(rttMs, thresholds_.rtt_excellent, 100.0,
+                                thresholds_.rtt_good, 80.0);
+    }
+    if (rttMs <= thresholds_.rtt_fair) {
+        return interpolateScore(rttMs, thresholds_.rtt_good, 80.0,
+                                thresholds_.rtt_fair, 60.0);
     }
 
-    return std::max(0.0, std::min(100.0, score));
+    // 保留旧模型 0.5 分/ms 的尾段和 20 分下限，同时从 fair 锚点连续衔接。
+    const double floorAtMs = thresholds_.rtt_fair + (60.0 - kRttMinimumScore) / 0.5;
+    return interpolateScore(rttMs, thresholds_.rtt_fair, 60.0,
+                            floorAtMs, kRttMinimumScore);
+}
+
+// TCP 重传代理值同样在三个业务阈值之间连续插值，并保留旧尾段斜率。
+double NetworkQualityAssessor::calculateTcpLossScore(double lossRate) {
+    if (!isTcpRetransmissionAvailable(lossRate)) return kUnavailableMetricScore;
+
+    if (lossRate <= thresholds_.tcp_loss_excellent) return 100.0;
+    if (lossRate <= thresholds_.tcp_loss_good) {
+        return interpolateScore(lossRate, thresholds_.tcp_loss_excellent, 100.0,
+                                thresholds_.tcp_loss_good, 80.0);
+    }
+    if (lossRate <= thresholds_.tcp_loss_fair) {
+        return interpolateScore(lossRate, thresholds_.tcp_loss_good, 80.0,
+                                thresholds_.tcp_loss_fair, 60.0);
+    }
+
+    const double floorAtRate = thresholds_.tcp_loss_fair
+        + (60.0 - kTcpMinimumScore) / 20.0;
+    return interpolateScore(lossRate, thresholds_.tcp_loss_fair, 60.0,
+                            floorAtRate, kTcpMinimumScore);
+}
+
+// RSSI 越接近 0 越好；-50/-60/-70dBm 仍对应 100/80/60，但区间内不再整档跳变。
+double NetworkQualityAssessor::calculateRssiScore(int rssiDbm) {
+    if (!isRssiAvailable(rssiDbm)) return kUnavailableMetricScore;
+
+    if (rssiDbm >= thresholds_.rssi_excellent) return 100.0;
+    if (rssiDbm >= thresholds_.rssi_good) {
+        return interpolateScore(rssiDbm, thresholds_.rssi_good, 80.0,
+                                thresholds_.rssi_excellent, 100.0);
+    }
+    if (rssiDbm >= thresholds_.rssi_fair) {
+        return interpolateScore(rssiDbm, thresholds_.rssi_fair, 60.0,
+                                thresholds_.rssi_good, 80.0);
+    }
+
+    const double floorAtDbm = thresholds_.rssi_fair
+        - (60.0 - kRssiMinimumScore) / 2.0;
+    return interpolateScore(rssiDbm, floorAtDbm, kRssiMinimumScore,
+                            thresholds_.rssi_fair, 60.0);
+}
+
+// 流量侧只作为弱证据：包大小贡献在 200..1000B 线性变化，样本量在 0..minFlows 平滑增信。
+double NetworkQualityAssessor::calculateTrafficScore(const NetInfo& interface) {
+    if (!isTrafficMetricAvailable(interface)) return kUnavailableMetricScore;
+
+    const double activeFlows = static_cast<double>(interface.trafficActiveFlows());
+    const double requiredFlows = std::max(1, thresholds_.min_flows_for_analysis);
+    const double sampleConfidence = std::clamp(activeFlows / requiredFlows, 0.0, 1.0);
+    const double bps = static_cast<double>(interface.trafficTotalBps());
+    const double pps = static_cast<double>(interface.trafficTotalPps());
+    const double averagePacketSize = bps / pps;
+    const double packetEvidence = interpolateScore(
+        averagePacketSize, 200.0, -50.0, 1000.0, 50.0);
+
+    // 置信度越高，正/负证据才越远离中性 50 分；负证据不能反向变成奖励。
+    return std::clamp(50.0 + sampleConfidence * packetEvidence, 0.0, 100.0);
 }
 
 // 根据原始指标阈值生成可读问题列表，便于上层直接展示或交给 AI 分析。
@@ -205,12 +240,15 @@ std::vector<std::string> NetworkQualityAssessor::detectNetworkIssues(const NetIn
     }
 
     // 根据项目字段 tcp_loss_rate 检测 TCP 重传代理指标问题。
-    if (interface.tcpLossRate() > thresholds_.tcp_loss_fair) {
-        issues.push_back("High packet loss: " + std::to_string(interface.tcpLossRate()) + "%");
+    if (isTcpRetransmissionAvailable(interface.tcpLossRate())
+        && interface.tcpLossRate() > thresholds_.tcp_loss_fair) {
+        issues.push_back("High TCP retransmission proxy: "
+            + std::to_string(interface.tcpLossRate()) + "%");
     }
 
     // 检测 RSSI 问题
-    if (interface.rssiDbm() != 0 && interface.rssiDbm() < thresholds_.rssi_fair) {
+    if (isRssiAvailable(interface.rssiDbm())
+        && interface.rssiDbm() < thresholds_.rssi_fair) {
         issues.push_back("Weak signal: " + std::to_string(interface.rssiDbm()) + "dBm");
     }
 
@@ -226,7 +264,7 @@ std::vector<std::string> NetworkQualityAssessor::detectNetworkIssues(const NetIn
         }
     }
 
-    // 评估整体网络质量
+    // 评估整体网络质量。
     if (score < 30) {
         issues.push_back("Poor overall network quality");
     } else if (score < 50) {
@@ -242,15 +280,24 @@ std::string NetworkQualityAssessor::generateMetricsJson(const NetInfo& interface
     json << "{";
     json << "\"interface\":\"" << interface.ifName() << "\",";
     json << "\"quality_score\":" << std::fixed << std::setprecision(1) << score << ",";
+    json << "\"score_model\":\"piecewise_linear_v2\",";
+    json << "\"metric_scores\":{";
+    json << "\"rtt\":" << std::fixed << std::setprecision(1) << calculateRttScore(interface.rttMs()) << ",";
+    json << "\"tcp_retransmission\":" << calculateTcpLossScore(interface.tcpLossRate()) << ",";
+    json << "\"rssi\":" << calculateRssiScore(interface.rssiDbm()) << ",";
+    json << "\"traffic\":" << calculateTrafficScore(interface) << "},";
     // quality_score 已把流设为 1 位小数，这里必须显式恢复 3 位精度，否则 0.134 会再次变成 0.1。
     // 非有限值不能直接写入 JSON；统一退回与领域模型一致的 -1 不可用哨兵。
     const double serializableRtt = isRttAvailable(interface.rttMs()) ? interface.rttMs() : -1.0;
     json << "\"rtt_ms\":" << std::fixed << std::setprecision(3) << serializableRtt << ",";
-    json << "\"tcp_loss_rate\":" << std::fixed << std::setprecision(2) << interface.tcpLossRate() << ",";
+    const double serializableTcp = isTcpRetransmissionAvailable(interface.tcpLossRate())
+        ? interface.tcpLossRate() : -1.0;
+    json << "\"tcp_loss_rate\":" << std::fixed << std::setprecision(2) << serializableTcp << ",";
     json << "\"rssi_dbm\":" << interface.rssiDbm() << ",";
     json << "\"traffic_bps\":" << interface.trafficTotalBps() << ",";
     json << "\"traffic_pps\":" << interface.trafficTotalPps() << ",";
     json << "\"active_flows\":" << interface.trafficActiveFlows() << ",";
+    // 保留旧 JSON 字段语义：quality_level 始终是 RTT 派生的 LinkQuality 数值。
     json << "\"quality_level\":" << static_cast<int>(interface.quality()) << ",";
     json << "\"using_now\":" << (interface.usingNow() ? "true" : "false") << ",";
     json << "\"issues\":[";
