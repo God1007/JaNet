@@ -1422,7 +1422,7 @@ function App() {
                     <circle className="orbit-track" cx="60" cy="60" r="52" />
                     <circle className="orbit-value" cx="60" cy="60" r="52" strokeDashoffset={scoreOffset} />
                   </svg>
-                  <div><strong>{score === null ? "n/a" : score.toFixed(0)}</strong><span>/100</span></div>
+                  <div><strong>{score === null ? "n/a" : score.toFixed(1)}</strong><span>/100</span></div>
                 </div>
                 <div className="quality-copy">
                   <StatusTag tone={quality?.degraded ? "warning" : "good"}>

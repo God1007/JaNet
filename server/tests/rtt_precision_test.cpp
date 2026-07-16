@@ -103,15 +103,24 @@ int main(int argc, char* argv[]) {
     TEST_CHECK(subMillisecondResult.score > unavailableResult.score);
     TEST_CHECK(zeroResult.score > unavailableResult.score);
 
-    // 锁定三个分段阈值及其右侧极小增量；若中间任何一层退回 int，+epsilon 会落回左侧档位。
+    // 锁定分段线性锚点、中点及阈值右侧极小增量；边界两侧只能连续变化，不能再整档跳 20 分。
     TEST_CHECK(nearlyEqual(rttSubscore(50.0), 100.0));
-    TEST_CHECK(nearlyEqual(rttSubscore(50.0 + kBoundaryEpsilon), 80.0));
+    TEST_CHECK(nearlyEqual(rttSubscore(75.0), 90.0));
+    TEST_CHECK(nearlyEqual(
+        rttSubscore(50.0 + kBoundaryEpsilon),
+        100.0 - kBoundaryEpsilon * 0.4));
     TEST_CHECK(nearlyEqual(rttSubscore(100.0), 80.0));
-    TEST_CHECK(nearlyEqual(rttSubscore(100.0 + kBoundaryEpsilon), 60.0));
+    TEST_CHECK(nearlyEqual(rttSubscore(150.0), 70.0));
+    TEST_CHECK(nearlyEqual(
+        rttSubscore(100.0 + kBoundaryEpsilon),
+        80.0 - kBoundaryEpsilon * 0.2));
     TEST_CHECK(nearlyEqual(rttSubscore(200.0), 60.0));
     TEST_CHECK(nearlyEqual(
         rttSubscore(200.0 + kBoundaryEpsilon),
         60.0 - kBoundaryEpsilon * 0.5));
+    TEST_CHECK(nearlyEqual(rttSubscore(240.0), 40.0));
+    TEST_CHECK(nearlyEqual(rttSubscore(280.0), 20.0));
+    TEST_CHECK(nearlyEqual(rttSubscore(1000.0), 20.0));
 
     // 质量详情也是对外数据面，不能被 score 的一位小数格式设置连带截断。
     TEST_CHECK(subMillisecondResult.details.find("\"rtt_ms\":0.134") != std::string::npos);
